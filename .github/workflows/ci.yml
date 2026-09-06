@@ -269,19 +269,27 @@ jobs:
         env:
           STAYAWAKE_NO_PAUSE: '1'
         run: |
-          rem The old launcher piped %* through `echo` to guess whether it needed
-          rem elevation, so an & in a path ran as a command. Nothing may execute
-          rem here except the script, and the path must arrive intact.
+          rem The old launcher piped the argument list through `echo` to guess
+          rem whether it needed elevation, which let an ampersand in a path run
+          rem as a command. Note that `rem` itself does not protect one, so this
+          rem comment must not contain the character it is describing.
+          rem Nothing may execute here except the script, and the path must
+          rem arrive intact.
           StayAwake.cmd -Restore -BackupFile "%RUNNER_TEMP%\a & b\nope.json" > out.txt 2>&1
+          echo --- script output ---
+          type out.txt
+          echo ---------------------
           if not errorlevel 1 (
-            echo Expected a nonzero exit for a missing backup file
-            type out.txt
+            echo FAIL: expected a nonzero exit for a missing backup file
             exit /b 1
           )
           findstr /C:"a & b" out.txt >nul
           if errorlevel 1 (
-            echo Argument with metacharacters did not reach the script intact
-            type out.txt
+            echo FAIL: argument with metacharacters did not reach the script intact
+            exit /b 1
+          )
+          if exist "b\nope.json" (
+            echo FAIL: part of the argument executed as a command
             exit /b 1
           )
           echo Metacharacter argument forwarded intact OK
