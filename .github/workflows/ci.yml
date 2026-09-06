@@ -156,6 +156,32 @@ jobs:
           }
           Write-Host 'Restore verified against the pristine backup: OK'
 
+      - name: Hibernate toggle is best-effort, not a hard dependency
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # These runners do not support hibernation, so this asserts that an
+          # unsupported optional toggle degrades instead of failing the run.
+          $supported = (& powercfg /availablesleepstates | Out-String) -match 'Hibernate'
+          Write-Host "Hibernation supported on this runner: $supported"
+          .\StayAwake.ps1
+          if ($LASTEXITCODE -ne 0) { throw "Apply must survive an unsupported hibernate toggle (exit $LASTEXITCODE)" }
+          .\StayAwake.ps1 -Restore
+          if ($LASTEXITCODE -ne 0) { throw "Restore must survive an unsupported hibernate toggle (exit $LASTEXITCODE)" }
+          Write-Host 'Hibernate toggle degraded cleanly: OK'
+
+      - name: Restore does not enable hibernation that was originally off
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Power'
+          $before = (Get-ItemProperty $key -ErrorAction SilentlyContinue).HibernateEnabled
+          .\StayAwake.ps1  | Out-Null
+          .\StayAwake.ps1 -Restore | Out-Null
+          $after = (Get-ItemProperty $key -ErrorAction SilentlyContinue).HibernateEnabled
+          if ("$before" -ne "$after") { throw "HibernateEnabled drifted across apply+restore: $before -> $after" }
+          Write-Host "HibernateEnabled preserved ($before): OK"
+
       - name: Opt-in tier applies and restores
         shell: powershell
         run: |

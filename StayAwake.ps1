@@ -145,9 +145,56 @@ function Resolve-RegPath {
     return $Path.Replace('<USERHIVE>', $UserHive)
 }
 
+function Invoke-PowerCfg {
+    <#
+        统一的 powercfg 调用点。
+        原生命令写 stderr 时，ErrorActionPreference='Stop' 会把它升级成终止异常，
+        于是 $LASTEXITCODE 根本轮不到检查，错误信息也会退化成 NativeCommandError。
+        这里把首选项临时降级，把退出码和原文一起交回调用方判断。
+    #>
+    param([Parameter(Mandatory = $true)][string[]]$Arguments)
+
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = & powercfg @Arguments 2>&1
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+    return [pscustomobject]@{
+        ExitCode = $code
+        Output   = (($output | Out-String).Trim())
+    }
+}
+
+function Get-HibernateEnabled {
+    # 语言无关地读休眠开关；未知时返回 $null。
+    $v = Get-RegValue -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Power' -Name 'HibernateEnabled'
+    if ($null -eq $v) { return $null }
+    return [int]$v
+}
+
+function Set-HibernateBestEffort {
+    <#
+        休眠开关是“额外收紧”，不是达成目标的必要条件——超时全零已经杜绝了
+        自动休眠。很多 VM 与部分 OEM 配置根本不支持它，那属于机器能力边界，
+        不该让整次操作失败；但也不能静默吞掉，所以如实打印 powercfg 的原文。
+    #>
+    param([ValidateSet('on', 'off')][string]$State)
+
+    $r = Invoke-PowerCfg -Arguments @('/hibernate', $State)
+    if ($r.ExitCode -ne 0) {
+        Write-Host ('  跳过休眠开关 ({0})：{1}' -f $State, $r.Output) -ForegroundColor DarkGray
+        return $false
+    }
+    return $true
+}
+
 function Get-ActiveSchemeGuid {
-    $out = & powercfg /getactivescheme 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "powercfg /getactivescheme 失败: $out" }
+    $r = Invoke-PowerCfg -Arguments @('/getactivescheme')
+    $out = $r.Output
+    if ($r.ExitCode -ne 0) { throw "powercfg /getactivescheme 失败: $out" }
     # GUID 格式与系统语言无关，直接从任意语言的输出里提取。
     $m = [regex]::Match(($out -join ' '), '[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}')
     if (-not $m.Success) { throw "无法从 powercfg 输出中解析当前电源方案 GUID: $out" }
@@ -239,10 +286,11 @@ function Get-CurrentState {
     }
 
     return [pscustomobject]@{
-        Scheme        = $scheme
-        UserHive      = $userHive
-        UserAccount   = $hiveInfo[1]
-        Items         = $items
+        Scheme            = $scheme
+        UserHive          = $userHive
+        UserAccount       = $hiveInfo[1]
+        HibernateEnabled  = (Get-HibernateEnabled)
+        Items             = $items
     }
 }
 
@@ -254,6 +302,8 @@ function Show-Status {
     Write-Host '当前状态' -ForegroundColor Cyan
     Write-Host ('  电源方案 : {0}' -f $state.Scheme)
     Write-Host ('  目标用户 : {0}' -f $state.UserAccount)
+    $hib = if ($null -eq $state.HibernateEnabled) { '(不支持/未知)' } elseif ([int]$state.HibernateEnabled -eq 1) { '已启用' } else { '已关闭' }
+    Write-Host ('  休眠功能 : {0}' -f $hib)
     Write-Host ''
 
     foreach ($item in $state.Items) {
@@ -296,6 +346,7 @@ function Invoke-Apply {
         Scheme            = $before.Scheme
         UserHive          = $before.UserHive
         UserAccount       = $before.UserAccount
+        HibernateEnabled  = $before.HibernateEnabled
         IncludeLockScreen = [bool]$IncludeLockScreen
         Items             = $before.Items
     }
@@ -304,29 +355,37 @@ function Invoke-Apply {
     Write-Host ('已备份原值 -> {0}' -f $BackupPath) -ForegroundColor DarkGray
 
     # ---- 2. 写入 ----
+    # 区分两种“没成功”：
+    #   skipped — 这台机器不支持该设置项，属于能力边界，不阻止其余项生效。
+    #   failure — 写进去了但读回不符，那是真问题（被策略覆盖或本脚本有 bug）。
     $scheme = $before.Scheme
+    $skipped = New-Object System.Collections.ArrayList
     foreach ($item in $before.Items) {
         if ($item.Kind -eq 'power') {
-            & powercfg /setacvalueindex $scheme $item.Sub $item.Setting $item.Target 2>&1 | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "powercfg /setacvalueindex 失败: $($item.Label)" }
-            & powercfg /setdcvalueindex $scheme $item.Sub $item.Setting $item.Target 2>&1 | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "powercfg /setdcvalueindex 失败: $($item.Label)" }
+            $ac = Invoke-PowerCfg -Arguments @('/setacvalueindex', $scheme, $item.Sub, $item.Setting, "$($item.Target)")
+            $dc = Invoke-PowerCfg -Arguments @('/setdcvalueindex', $scheme, $item.Sub, $item.Setting, "$($item.Target)")
+            if ($ac.ExitCode -ne 0 -or $dc.ExitCode -ne 0) {
+                $msg = if ($ac.ExitCode -ne 0) { $ac.Output } else { $dc.Output }
+                [void]$skipped.Add([pscustomobject]@{ Key = $item.Key; Label = $item.Label; Reason = $msg })
+            }
         } else {
             Set-RegValue -Path $item.Path -Name $item.Name -Value $item.Target -Type $item.Type
         }
     }
 
     # 让方案生效（写 index 后必须重新激活，否则运行中的会话仍用旧值）
-    & powercfg /setactive $scheme 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw 'powercfg /setactive 失败' }
+    $activate = Invoke-PowerCfg -Arguments @('/setactive', $scheme)
+    if ($activate.ExitCode -ne 0) { throw "powercfg /setactive 失败: $($activate.Output)" }
 
     # 休眠功能本身：关掉才能杜绝“混合睡眠/快速启动”路径上的自动休眠。
-    & powercfg /hibernate off 2>&1 | Out-Null
+    [void](Set-HibernateBestEffort -State 'off')
 
     # ---- 3. 读回验证 ----
     $after = Get-CurrentState -IncludeLockScreen:$IncludeLockScreen
+    $skippedKeys = @($skipped | ForEach-Object { $_.Key })
     $failures = New-Object System.Collections.ArrayList
     foreach ($item in $after.Items) {
+        if ($skippedKeys -contains $item.Key) { continue }
         if ($item.Kind -eq 'power') {
             if ($item.AC -ne $item.Target) { [void]$failures.Add("$($item.Label) 交流侧读回 = $(Format-Value $item.AC)，期望 $($item.Target)") }
             if ($item.DC -ne $item.Target) { [void]$failures.Add("$($item.Label) 电池侧读回 = $(Format-Value $item.DC)，期望 $($item.Target)") }
@@ -345,9 +404,14 @@ function Invoke-Apply {
         exit 1
     }
 
-    Write-Host '全部 ' -NoNewline -ForegroundColor Green
-    Write-Host ("{0}" -f $after.Items.Count) -NoNewline -ForegroundColor Green
-    Write-Host ' 项已写入并读回验证通过。' -ForegroundColor Green
+    if ($skipped.Count -gt 0) {
+        Write-Host '这台机器不支持以下设置项，已跳过（其余项已生效）：' -ForegroundColor Yellow
+        foreach ($s in $skipped) { Write-Host ('  - {0}: {1}' -f $s.Label, $s.Reason) -ForegroundColor Yellow }
+        Write-Host ''
+    }
+
+    $verified = $after.Items.Count - $skipped.Count
+    Write-Host ('{0} 项已写入并读回验证通过。' -f $verified) -ForegroundColor Green
     if (-not $IncludeLockScreen) {
         Write-Host '注意：唤醒密码、Win+L、锁屏界面保持原样（需要时加 -DisableLockScreen）。' -ForegroundColor DarkGray
     }
@@ -385,8 +449,8 @@ function Invoke-Restore {
                 if (Test-Path $p) { Remove-Item -Path $p -Force -Recurse -ErrorAction SilentlyContinue }
                 continue
             }
-            if ($null -ne $item.AC) { & powercfg /setacvalueindex $scheme $item.Sub $item.Setting $item.AC 2>&1 | Out-Null }
-            if ($null -ne $item.DC) { & powercfg /setdcvalueindex $scheme $item.Sub $item.Setting $item.DC 2>&1 | Out-Null }
+            if ($null -ne $item.AC) { [void](Invoke-PowerCfg -Arguments @('/setacvalueindex', $scheme, $item.Sub, $item.Setting, "$($item.AC)")) }
+            if ($null -ne $item.DC) { [void](Invoke-PowerCfg -Arguments @('/setdcvalueindex', $scheme, $item.Sub, $item.Setting, "$($item.DC)")) }
         } else {
             if ($null -eq $item.Value) {
                 Remove-RegValue -Path $item.Path -Name $item.Name
@@ -396,8 +460,16 @@ function Invoke-Restore {
         }
     }
 
-    & powercfg /setactive $scheme 2>&1 | Out-Null
-    & powercfg /hibernate on 2>&1 | Out-Null
+    $activate = Invoke-PowerCfg -Arguments @('/setactive', $scheme)
+    if ($activate.ExitCode -ne 0) { throw "powercfg /setactive 失败: $($activate.Output)" }
+
+    # 恢复休眠到备份记录的原状态，而不是无脑打开——原本就没开休眠的机器
+    # 被“回滚”成开着，那不是回滚。
+    $hadHibernate = $null
+    if ($backup.PSObject.Properties.Name -contains 'HibernateEnabled') { $hadHibernate = $backup.HibernateEnabled }
+    if ($null -ne $hadHibernate) {
+        [void](Set-HibernateBestEffort -State $(if ([int]$hadHibernate -eq 1) { 'on' } else { 'off' }))
+    }
 
     # 读回验证：每一项都必须回到备份里的原值
     $after = Get-CurrentState -IncludeLockScreen:([bool]$backup.IncludeLockScreen)
