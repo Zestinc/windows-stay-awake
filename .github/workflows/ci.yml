@@ -138,14 +138,18 @@ jobs:
           # holds the values from before this tool first touched the machine.
           $first = Join-Path $env:ProgramData 'StayAwake\backup-pristine.json'
           if (-not (Test-Path $first)) { throw 'Apply did not create backup-pristine.json' }
+
+          # Read it before restoring: a default restore consumes the pristine
+          # backup and deletes it, so the expected values must be captured now.
+          $backup = Get-Content $first -Raw -Encoding UTF8 | ConvertFrom-Json
+          $scheme = $backup.Scheme
+
           Write-Host "Restoring from $first"
           .\StayAwake.ps1 -Restore -BackupFile $first
           if ($LASTEXITCODE -ne 0) { throw "Restore exited $LASTEXITCODE" }
 
           # Restore recovers the effective value, not the presence of a registry
           # key: powercfg has no "unset", and /setactive rebuilds a deleted key.
-          $backup = Get-Content $first.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
-          $scheme = $backup.Scheme
           $checked = 0
           foreach ($item in ($backup.Items | Where-Object { $_.Kind -eq 'power' })) {
             if ($null -eq $item.AC -and $null -eq $item.DC) { continue }
