@@ -8,7 +8,7 @@
 
 把 `StayAwake.ps1` 和 `StayAwake.cmd` 放同一个目录，然后：
 
-- **双击 `StayAwake.cmd`** — 自动请求管理员权限，应用预设层，逐项读回验证。
+- **双击 `StayAwake.cmd`** — 自动请求管理员权限，应用预设层，逐项读回验证，并立即同步当前会话的屏保状态。
 - `StayAwake.cmd -Status` — 只读查看当前状态，不需要管理员。
 - `StayAwake.cmd -Restore` — 回滚到最近一次备份。
 - `StayAwake.cmd -Guard` — 前台守护模式（见下）。
@@ -93,9 +93,29 @@
 
 回滚按备份里记录的路径逐项读回验证，不一致就以退出码 1 失败。
 
+## 2026-09-06 屏保修复
+
+旧版只写注册表，可能出现保存值为关闭、当前会话仍执行 300 秒屏保的情况。
+新版默认 Apply 会调用 `SystemParametersInfoW` 关闭屏保并把等待时间设为 0，
+保存并广播更新，随后用 `SPI_GET*` 回读运行值；不需要额外参数或重启。
+`-Status` 同时显示注册表与当前进程会话的 Active / Timeout / Secure。
+
+更新时把同目录中的 `StayAwake.ps1` 替换为新版，随后双击 `StayAwake.cmd`。
+看到 `Screen saver runtime verified: Active=0 Timeout=0` 表示运行状态验证通过。
+默认仍不修改屏保恢复密码；只有 `-DisableLockScreen` 才同步这一项。
+
+运行状态单独备份；重复 Apply 不覆盖首次值，旧 pristine 在下一次 Apply 时补录。
+Restore 分别恢复保存值与运行值，即使原先二者不一致也保留原状。
+未经新版 Apply 补录的旧备份无法证明原运行值，Restore 会在修改前明确拒绝。
+不同管理员账户或不同控制台会话不能代替目标用户执行屏保 API，程序会在修改前拒绝。
+无人登录时只处理当前进程会话并保留原有警告，不代表验证了其他用户的桌面。
+
+本修复针对已确认的屏保缓存问题，不证明解决了所有注销、重启或厂商软件锁定。
+API 依据：[Microsoft SystemParametersInfoW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-systemparametersinfow)。
+
 ## 验证
 
-Apply 和 Restore 都不会只打印“已完成”：写完后重新读一遍注册表，逐项比对期望值，任何一项对不上就打印差异并返回非零退出码。
+Apply 和 Restore 都不会只打印“已完成”：写完后重新读取注册表和屏保运行状态，逐项比对期望值，任何一项对不上就打印差异并返回非零退出码。
 
 `.github/workflows/ci.yml` 在 windows-2022 和 windows-2025 两个真实 Windows 上跑：只读性（`-Status` 不改配置）、Apply 后独立复查注册表、预设层不得动认证相关项、幂等、Restore 精确回到原值、`-DisableLockScreen` 层的应用与回滚、守护模式持有 power request、`.cmd` 入口转发参数。
 

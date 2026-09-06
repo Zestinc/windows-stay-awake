@@ -70,6 +70,10 @@ jobs:
           if ($before -ne $after) { throw 'Status mutated power configuration' }
           Write-Host 'Status is read-only: OK'
 
+      - name: Reproduce stale 300-second screen saver and verify runtime restore
+        shell: powershell
+        run: ./tests/screensaver-runtime.ps1
+
       - name: Apply preset tier, then assert every timeout is zero
         shell: powershell
         run: |

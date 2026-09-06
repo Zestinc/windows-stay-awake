@@ -230,6 +230,73 @@ function Get-InteractiveUserHive {
     return [pscustomobject]@{ Hive = $hive; Account = $userName; Resolved = $true; Note = $null }
 }
 
+# SPI acts on the calling session, not an arbitrary HKEY_USERS hive.
+function Initialize-ScreenSaverApi {
+    if ('StayAwake.ScreenSaverApi' -as [type]) { return }
+    Add-Type -Namespace StayAwake -Name ScreenSaverApi -MemberDefinition @'
+[DllImport("user32.dll", EntryPoint = "SystemParametersInfoW", SetLastError = true)]
+[return: MarshalAs(UnmanagedType.Bool)]
+public static extern bool Get(uint action, uint param, out uint value, uint flags);
+[DllImport("user32.dll", EntryPoint = "SystemParametersInfoW", SetLastError = true)]
+[return: MarshalAs(UnmanagedType.Bool)]
+public static extern bool Set(uint action, uint param, IntPtr value, uint flags);
+[DllImport("kernel32.dll")]
+public static extern uint WTSGetActiveConsoleSessionId();
+'@
+}
+
+function Get-ScreenSaverRuntime {
+    Initialize-ScreenSaverApi
+    $values = @{}
+    foreach ($pair in @(@('Active', 0x10), @('Timeout', 0x0E), @('Secure', 0x76))) {
+        [uint32]$value = 0
+        if (-not [StayAwake.ScreenSaverApi]::Get($pair[1], 0, [ref]$value, 0)) {
+            throw "屏保运行状态读取失败：$($pair[0])，Win32=$([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+        }
+        $values[$pair[0]] = $value
+    }
+    return [pscustomobject]@{
+        Active = $values.Active; Timeout = $values.Timeout; Secure = $values.Secure
+        UserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        SessionId = (Get-Process -Id $PID).SessionId
+    }
+}
+
+function Assert-ScreenSaverContext {
+    param([string]$UserHive, $Runtime)
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    if ($UserHive -ne 'HKCU:' -and $UserHive -ne "Registry::HKEY_USERS\$sid") {
+        throw '屏保运行状态只能在目标用户自己的会话中更新；请以正在使用桌面的账户运行，不能用另一管理员账户代替。尚未修改设置。'
+    }
+    Initialize-ScreenSaverApi
+    $target = Get-InteractiveUserHive
+    if ($target.Resolved -and (Get-Process -Id $PID).SessionId -ne [StayAwake.ScreenSaverApi]::WTSGetActiveConsoleSessionId()) {
+        throw '当前进程不在目标控制台会话，无法同步其屏保运行状态；请在目标 Windows 桌面运行。尚未修改设置。'
+    }
+    if ($null -ne $Runtime -and $Runtime.UserSid -ne $sid) {
+        throw '备份属于另一用户，不能把其屏保运行状态恢复到当前账户。尚未修改设置。'
+    }
+}
+
+function Set-ScreenSaverRuntime {
+    param([uint32]$Active, [uint32]$Timeout, [switch]$IncludeSecure,
+          [uint32]$Secure, [uint32]$Flags = 3)
+    Initialize-ScreenSaverApi
+    $pairs = @(@(0x0F, $Timeout), @(0x11, $Active))
+    if ($IncludeSecure) { $pairs += ,@(0x77, $Secure) }
+    foreach ($pair in $pairs) {
+        if (-not [StayAwake.ScreenSaverApi]::Set($pair[0], $pair[1], [IntPtr]::Zero, $Flags)) {
+            throw "屏保运行状态更新失败：SPI=$($pair[0])，Win32=$([Runtime.InteropServices.Marshal]::GetLastWin32Error())；原值已备份，可运行 -Restore。"
+        }
+    }
+    $actual = Get-ScreenSaverRuntime
+    if ($actual.Active -ne $Active -or $actual.Timeout -ne $Timeout -or
+        ($IncludeSecure -and $actual.Secure -ne $Secure)) {
+        throw "屏保运行状态验证失败：Active=$($actual.Active), Timeout=$($actual.Timeout), Secure=$($actual.Secure)"
+    }
+    Write-Host "Screen saver runtime verified: Active=$Active Timeout=$Timeout Session=$($actual.SessionId)" -ForegroundColor Green
+}
+
 function Get-ScreenSaverPolicyConflicts {
     <#
         组策略位置优先于普通的 Control Panel\Desktop。域里（或本机组策略里）
@@ -458,6 +525,11 @@ function Show-Status {
     Write-Host '当前状态' -ForegroundColor Cyan
     Write-Host ('  电源方案 : {0}' -f $state.Scheme)
     Write-Host ('  目标用户 : {0}' -f $state.UserAccount)
+    $runtime = Get-ScreenSaverRuntime
+    Write-Host ('  当前会话屏保 : Active={0} Timeout={1} Secure={2} Session={3}' -f $runtime.Active, $runtime.Timeout, $runtime.Secure, $runtime.SessionId)
+    if ($state.UserHive -ne 'HKCU:') {
+        Write-Host '  当前进程与目标用户不同：以上运行值不能证明目标桌面状态。' -ForegroundColor Yellow
+    }
     $hib = if ($null -eq $state.HibernateEnabled) { '(不支持/未知)' } elseif ([int]$state.HibernateEnabled -eq 1) { '已启用' } else { '已关闭' }
     Write-Host ('  休眠功能 : {0}' -f $hib)
     if (-not $state.UserResolved -and $state.UserNote) {
@@ -493,6 +565,8 @@ function Invoke-Apply {
     }
 
     $before = Get-CurrentState -IncludeLockScreen:$IncludeLockScreen
+    Assert-ScreenSaverContext -UserHive $before.UserHive
+    $runtimeBefore = Get-ScreenSaverRuntime
 
     # ---- 1. 先备份，再改 ----
     if (-not (Test-Path $script:StateDir)) { New-Item -Path $script:StateDir -ItemType Directory -Force | Out-Null }
@@ -508,6 +582,7 @@ function Invoke-Apply {
         UserAccount       = $before.UserAccount
         HibernateEnabled  = $before.HibernateEnabled
         IncludeLockScreen = [bool]$IncludeLockScreen
+        ScreenSaverRuntime = $runtimeBefore
         Items             = $before.Items
     }
     $backup | ConvertTo-Json -Depth 6 | Set-Content -Path $BackupPath -Encoding UTF8
@@ -524,6 +599,12 @@ function Invoke-Apply {
         # 这次带上了 -DisableLockScreen）。那些项此刻还没被本次写入改动，
         # 现在的值就是它们的原值，补进去。
         $pristine = Get-Content -Path $pristinePath -Raw -Encoding UTF8 | ConvertFrom-Json
+        Assert-ScreenSaverContext -UserHive $pristine.UserHive
+        if ($pristine.PSObject.Properties.Name -notcontains 'ScreenSaverRuntime') {
+            $pristine | Add-Member -NotePropertyName ScreenSaverRuntime -NotePropertyValue $runtimeBefore
+            $pristine | ConvertTo-Json -Depth 6 | Set-Content -Path $pristinePath -Encoding UTF8
+        }
+        Assert-ScreenSaverContext -UserHive $pristine.UserHive -Runtime $pristine.ScreenSaverRuntime
         $known = @($pristine.Items | ForEach-Object { $_.Key })
         $missing = @($before.Items | Where-Object { $known -notcontains $_.Key })
         if ($missing.Count -gt 0) {
@@ -556,6 +637,9 @@ function Invoke-Apply {
 
     # 休眠功能本身：关掉才能杜绝“混合睡眠/快速启动”路径上的自动休眠。
     [void](Set-HibernateBestEffort -State 'off')
+
+    # 保存值与会话缓存必须分别更新，单写注册表不会关闭已缓存的屏保。
+    Set-ScreenSaverRuntime -Active 0 -Timeout 0 -IncludeSecure:$IncludeLockScreen -Secure 0
 
     # ---- 3. 读回验证 ----
     # 判据以读回结果为准，写入时的退出码只是线索。三分：
@@ -659,6 +743,15 @@ function Invoke-Restore {
     $backup = Get-Content -Path $BackupPath -Raw -Encoding UTF8 | ConvertFrom-Json
     Write-Host ('从 {0} 回滚（备份于 {1}）' -f $BackupPath, $backup.CreatedAt) -ForegroundColor Cyan
 
+    $runtimeOriginal = $null
+    if ($backup.PSObject.Properties.Name -contains 'ScreenSaverRuntime') {
+        $runtimeOriginal = $backup.ScreenSaverRuntime
+    }
+    Assert-ScreenSaverContext -UserHive $backup.UserHive -Runtime $runtimeOriginal
+    if ($null -eq $runtimeOriginal) {
+        throw '旧备份未记录屏保运行状态，无法精确回滚当前会话；请使用新版 Apply 生成或补录的备份。尚未修改设置。'
+    }
+
     $scheme = $backup.Scheme
     foreach ($item in $backup.Items) {
         if ($item.Kind -eq 'power') {
@@ -685,6 +778,11 @@ function Invoke-Restore {
     if ($null -ne $hadHibernate) {
         [void](Set-HibernateBestEffort -State $(if ([int]$hadHibernate -eq 1) { 'on' } else { 'off' }))
     }
+
+    # 仅恢复运行缓存并广播（flags=2），避免把当时不一致的注册表原值覆盖掉。
+    $restoreSecure = @($backup.Items | Where-Object { $_.Key -eq 'ScreenSaverIsSecure' }).Count -gt 0
+    Set-ScreenSaverRuntime -Active $runtimeOriginal.Active -Timeout $runtimeOriginal.Timeout `
+        -IncludeSecure:$restoreSecure -Secure $runtimeOriginal.Secure -Flags 2
 
     # 读回验证：直接按备份里记录的路径读，不重新解析「当前交互用户」。
     # 备份写的是 A 的 hive，若此刻登录的是 B，重新解析会去比 B 的值，
