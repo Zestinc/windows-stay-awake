@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     关闭 Windows 的全部自动休眠 / 自动关屏 / 自动锁屏，让机器保持唤醒并持续显示当前界面。

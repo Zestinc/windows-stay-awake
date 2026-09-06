@@ -19,9 +19,21 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           persist-credentials: false
+
+      - name: Script must carry a UTF-8 BOM
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Windows PowerShell 5.1 decodes BOM-less files using the system ANSI
+          # code page, which mangles the Chinese strings and breaks parsing.
+          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path .\StayAwake.ps1))
+          if ($bytes[0] -ne 0xEF -or $bytes[1] -ne 0xBB -or $bytes[2] -ne 0xBF) {
+            throw ('StayAwake.ps1 has no UTF-8 BOM (first bytes: {0:X2} {1:X2} {2:X2})' -f $bytes[0], $bytes[1], $bytes[2])
+          }
+          Write-Host 'UTF-8 BOM present: OK'
 
       - name: Parse with Windows PowerShell 5.1
         shell: powershell
@@ -34,6 +46,18 @@ jobs:
             (Resolve-Path .\StayAwake.ps1), [ref]$tokens, [ref]$errors)
           if ($errors) { $errors | Format-List -Force; throw 'Parse failed' }
           Write-Host 'Parse OK'
+
+      - name: Chinese output survives round-trip decoding
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Guards the same failure at runtime rather than only at parse time.
+          # This workflow file itself is BOM-less, so the expected string is built
+          # from code points instead of being written literally.
+          $expect = -join ([char]0x7535, [char]0x6E90, [char]0x65B9, [char]0x6848)  # 电源方案
+          $out = .\StayAwake.ps1 -Status 6>&1 | Out-String
+          if ($out -notmatch $expect) { throw "Chinese labels came back mangled:`n$out" }
+          Write-Host 'Chinese labels intact: OK'
 
       - name: Status is read-only and needs no elevation
         shell: powershell
