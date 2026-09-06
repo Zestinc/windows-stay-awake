@@ -109,6 +109,48 @@ function Test-Administrator {
     return $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Invoke-SelfElevate {
+    <#
+        以管理员身份重新拉起自己。
+
+        提权判断必须在这一层做：启动器只能对命令行做字符串匹配来猜要不要提权，
+        那份猜测跟这里真正的参数集解析是两套逻辑，迟早漂移；而参数经 cmd 的
+        %* 二次内插后，带空格或 & 的值会直接碎掉。这里用 $PSBoundParameters
+        精确重建，Start-Process 的数组形参负责引用，绕开所有 cmd 转义。
+
+        无交互桌面（SSH 会话、计划任务、服务）里 UAC 弹不出来，这种情况必须
+        明说怎么办，而不是丢一个神秘失败——从 Mac SSH 过来正是常见用法。
+    #>
+    param([hashtable]$BoundParameters)
+
+    if (-not [Environment]::UserInteractive) {
+        throw ('需要管理员权限，但当前会话没有交互桌面（SSH / 计划任务 / 服务），UAC 无法弹出。' + [Environment]::NewLine +
+               '请改用具备管理员身份的账户运行，或在这台机器上开一个管理员 PowerShell 再执行。')
+    }
+
+    $psExe = (Get-Process -Id $PID).Path
+    $argList = New-Object System.Collections.ArrayList
+    foreach ($a in @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-NoExit', '-File', $PSCommandPath)) {
+        [void]$argList.Add($a)
+    }
+    foreach ($kv in $BoundParameters.GetEnumerator()) {
+        if ($kv.Value -is [System.Management.Automation.SwitchParameter]) {
+            if ($kv.Value.IsPresent) { [void]$argList.Add("-$($kv.Key)") }
+        } else {
+            [void]$argList.Add("-$($kv.Key)")
+            [void]$argList.Add([string]$kv.Value)
+        }
+    }
+
+    Write-Host '正在请求管理员权限…' -ForegroundColor Cyan
+    try {
+        [void](Start-Process -FilePath $psExe -Verb RunAs -ArgumentList $argList.ToArray() -ErrorAction Stop)
+    } catch {
+        throw ('提权被取消或失败：{0}' -f $_.Exception.Message)
+    }
+    Write-Host '已在新的管理员窗口中继续，本窗口可以关闭。' -ForegroundColor Green
+}
+
 function Get-InteractiveUserHive {
     <#
         返回 ('Registry::HKEY_USERS\<SID>', '<账户名>')。
@@ -569,6 +611,13 @@ public static extern uint SetThreadExecutionState(uint esFlags);
 # ==========================================================================
 
 try {
+    # -Status 与 -Guard 是只读/进程内的，不需要管理员；改配置的两条路要。
+    $needsAdmin = -not ($Status -or $Guard)
+    if ($needsAdmin -and -not (Test-Administrator)) {
+        Invoke-SelfElevate -BoundParameters $PSBoundParameters
+        exit 0
+    }
+
     if ($Status) {
         Show-Status -IncludeLockScreen
     } elseif ($Restore) {

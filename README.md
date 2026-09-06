@@ -16,6 +16,23 @@
 
 也可以直接调脚本：`powershell -ExecutionPolicy Bypass -File .\StayAwake.ps1 -Status`
 
+## 管理员权限
+
+- `-Status`、`-Guard` 不需要管理员（一个只读，一个只在自己进程内声明状态）。
+- Apply 和 `-Restore` 需要管理员，因为要写 `HKLM` 和全局电源方案。
+
+权限判断由 `StayAwake.ps1` 自己做（`WindowsPrincipal`），检测到需要提权时用
+`Start-Process -Verb RunAs` 以管理员身份重新拉起自己，参数由 `$PSBoundParameters`
+精确重建后经数组传递，不经过任何 cmd 转义。新窗口带 `-NoExit`，跑完结果还在。
+
+`StayAwake.cmd` 只是双击入口（双击 `.ps1` 会打开编辑器而不是执行），它**不**判断
+权限：批处理只能对命令行做字符串匹配来猜，这份猜测会和脚本真正的参数集解析漂移，
+而把 `%*` 通过 `echo` 管道传递还会让含 `&` 的参数当成命令执行。
+
+**从 SSH 会话运行时**（例如从 Mac 连过去）没有交互桌面，UAC 弹不出来。脚本会明确
+说明这一点并退出，而不是神秘失败——请用本身具备管理员身份的账户登录，或在那台机器
+上开一个管理员 PowerShell 执行。
+
 ## 两层设计
 
 安全边界不会被静默降低，所以分成两层。
