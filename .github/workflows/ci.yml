@@ -231,11 +231,29 @@ jobs:
             throw "Guard exited early with code $($proc.ExitCode)"
           }
 
-          # powercfg /requests names the requesting process when a request is held.
+          # Staying alive proves nothing on its own; assert the kernel actually
+          # holds a DISPLAY and a SYSTEM request naming a powershell process.
           $requests = & powercfg /requests | Out-String
           Write-Host $requests
           Stop-Process -Id $proc.Id -Force
-          Write-Host 'Guard stayed alive holding the request: OK'
+
+          foreach ($section in @('DISPLAY', 'SYSTEM')) {
+            $m = [regex]::Match($requests, "(?ms)^$section\:\s*\r?\n(.*?)(\r?\n\r?\n|\z)")
+            if (-not $m.Success) { throw "powercfg /requests has no $section section" }
+            $body = $m.Groups[1].Value
+            if ($body -match 'None\.') { throw "$section request was not held (reported None)" }
+            if ($body -notmatch 'powershell\.exe') { throw "$section request is not attributed to powershell.exe:`n$body" }
+            Write-Host "  $section request held by powershell.exe: OK"
+          }
+
+          # And it must let go on exit rather than leaking a permanent request.
+          Start-Sleep -Seconds 2
+          $after = & powercfg /requests | Out-String
+          $m = [regex]::Match($after, "(?ms)^DISPLAY\:\s*\r?\n(.*?)(\r?\n\r?\n|\z)")
+          if ($m.Success -and $m.Groups[1].Value -match 'powershell\.exe') {
+            throw "DISPLAY request survived guard exit:`n$($m.Groups[1].Value)"
+          }
+          Write-Host '  request released after exit: OK'
 
       - name: Launcher routes arguments without elevating read-only modes
         shell: cmd
