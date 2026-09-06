@@ -1,0 +1,172 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Parse with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "PSVersion: $($PSVersionTable.PSVersion)"
+          if ($PSVersionTable.PSVersion.Major -ne 5) { throw 'Expected Windows PowerShell 5.1 for this job' }
+          $tokens = $null; $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path .\StayAwake.ps1), [ref]$tokens, [ref]$errors)
+          if ($errors) { $errors | Format-List -Force; throw 'Parse failed' }
+          Write-Host 'Parse OK'
+
+      - name: Status is read-only and needs no elevation
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $before = & powercfg /query SCHEME_CURRENT | Out-String
+          .\StayAwake.ps1 -Status
+          if ($LASTEXITCODE -ne 0) { throw "Status exited $LASTEXITCODE" }
+          $after = & powercfg /query SCHEME_CURRENT | Out-String
+          if ($before -ne $after) { throw 'Status mutated power configuration' }
+          Write-Host 'Status is read-only: OK'
+
+      - name: Apply preset tier, then assert every timeout is zero
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\StayAwake.ps1
+          if ($LASTEXITCODE -ne 0) { throw "Apply exited $LASTEXITCODE" }
+
+          # Independent check: re-read the registry directly, not through the script.
+          $scheme = ([regex]::Match((& powercfg /getactivescheme | Out-String),
+            '[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}')).Value
+          $cases = @(
+            @{ Sub='7516b95f-f776-4464-8c53-06167f40cc99'; Set='3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e'; Name='monitor timeout' },
+            @{ Sub='7516b95f-f776-4464-8c53-06167f40cc99'; Set='8ec4b3a5-6868-48c2-be75-4f3044be88a7'; Name='console lock display off' },
+            @{ Sub='238c9fa8-0aad-41ed-83f4-97be242c8f20'; Set='29f6c1db-86da-48c5-9fdb-f2b67b1f44da'; Name='standby timeout' },
+            @{ Sub='238c9fa8-0aad-41ed-83f4-97be242c8f20'; Set='9d7815a6-7ee4-497e-8888-515a05f02364'; Name='hibernate timeout' },
+            @{ Sub='238c9fa8-0aad-41ed-83f4-97be242c8f20'; Set='7bc4a2f9-d8fc-4469-b07b-33eb785aaca0'; Name='unattended sleep' },
+            @{ Sub='0012ee47-9041-4b5d-9b77-535fba8b1442'; Set='6738e2c4-e8a5-4a42-b16a-e040e769756e'; Name='disk timeout' }
+          )
+          foreach ($c in $cases) {
+            $p = "HKLM:\SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes\$scheme\$($c.Sub)\$($c.Set)"
+            $v = Get-ItemProperty -Path $p -ErrorAction Stop
+            if ($v.ACSettingIndex -ne 0) { throw "$($c.Name) AC = $($v.ACSettingIndex), expected 0" }
+            if ($v.DCSettingIndex -ne 0) { throw "$($c.Name) DC = $($v.DCSettingIndex), expected 0" }
+            Write-Host "  $($c.Name): AC=0 DC=0 OK"
+          }
+
+          $inact = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System').InactivityTimeoutSecs
+          if ($inact -ne 0) { throw "InactivityTimeoutSecs = $inact, expected 0" }
+          Write-Host '  InactivityTimeoutSecs: 0 OK'
+
+      - name: Preset tier must not weaken authentication
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # CONSOLELOCK (prompt for password on wake) belongs to the opt-in tier only.
+          $scheme = ([regex]::Match((& powercfg /getactivescheme | Out-String),
+            '[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}')).Value
+          $p = "HKLM:\SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes\$scheme\fea3413e-88d6-4123-a466-e9f8b03e494d\0e796bdb-100d-47d6-a2d5-f7d2daa51f51"
+          $consoleLock = if (Test-Path $p) { (Get-ItemProperty $p).ACSettingIndex } else { 'unset' }
+          if ($consoleLock -eq 0) { throw 'Preset tier disabled the wake password prompt; that belongs to -DisableLockScreen' }
+
+          $nolock = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization' -ErrorAction SilentlyContinue
+          if ($nolock -and $nolock.NoLockScreen -eq 1) { throw 'Preset tier disabled the lock screen' }
+
+          $winl = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -ErrorAction SilentlyContinue
+          if ($winl -and $winl.PSObject.Properties.Name -contains 'DisableLockWorkstation' -and $winl.DisableLockWorkstation -eq 1) {
+            throw 'Preset tier disabled Win+L'
+          }
+          Write-Host 'Security boundary intact after preset apply: OK'
+
+      - name: Apply is idempotent
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\StayAwake.ps1
+          if ($LASTEXITCODE -ne 0) { throw "Second apply exited $LASTEXITCODE" }
+          .\StayAwake.ps1
+          if ($LASTEXITCODE -ne 0) { throw "Third apply exited $LASTEXITCODE" }
+          Write-Host 'Idempotent: OK'
+
+      - name: Restore returns settings to the recorded originals
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The very first backup holds the pristine pre-test values.
+          $first = Get-ChildItem "$env:ProgramData\StayAwake\backup-*.json" |
+                   Where-Object { $_.Name -ne 'backup-latest.json' } |
+                   Sort-Object Name | Select-Object -First 1
+          Write-Host "Restoring from $($first.FullName)"
+          .\StayAwake.ps1 -Restore -BackupFile $first.FullName
+          if ($LASTEXITCODE -ne 0) { throw "Restore exited $LASTEXITCODE" }
+
+          $backup = Get-Content $first.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+          $scheme = $backup.Scheme
+          foreach ($item in ($backup.Items | Where-Object { $_.Kind -eq 'power' })) {
+            $p = "HKLM:\SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes\$scheme\$($item.Sub)\$($item.Setting)"
+            if ($null -eq $item.AC -and $null -eq $item.DC) {
+              if (Test-Path $p) { throw "$($item.Key): expected the key to be removed, it still exists" }
+              continue
+            }
+            $v = Get-ItemProperty -Path $p -ErrorAction Stop
+            if ("$($v.ACSettingIndex)" -ne "$($item.AC)") { throw "$($item.Key) AC = $($v.ACSettingIndex), expected $($item.AC)" }
+            if ("$($v.DCSettingIndex)" -ne "$($item.DC)") { throw "$($item.Key) DC = $($v.DCSettingIndex), expected $($item.DC)" }
+          }
+          Write-Host 'Restore verified against the pristine backup: OK'
+
+      - name: Opt-in tier applies and restores
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\StayAwake.ps1 -DisableLockScreen
+          if ($LASTEXITCODE -ne 0) { throw "DisableLockScreen apply exited $LASTEXITCODE" }
+
+          $nolock = (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization').NoLockScreen
+          if ($nolock -ne 1) { throw "NoLockScreen = $nolock, expected 1" }
+          $winl = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System').DisableLockWorkstation
+          if ($winl -ne 1) { throw "DisableLockWorkstation = $winl, expected 1" }
+          Write-Host '  opt-in tier applied OK'
+
+          .\StayAwake.ps1 -Restore
+          if ($LASTEXITCODE -ne 0) { throw "Restore after opt-in exited $LASTEXITCODE" }
+          Write-Host '  restore after opt-in OK'
+
+      - name: Guard mode holds an execution-state request
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $proc = Start-Process powershell -PassThru -WindowStyle Hidden `
+            -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','.\StayAwake.ps1','-Guard'
+          Start-Sleep -Seconds 12
+          if ($proc.HasExited) { throw "Guard exited early with code $($proc.ExitCode)" }
+
+          # powercfg /requests names the requesting process when a request is held.
+          $requests = & powercfg /requests | Out-String
+          Write-Host $requests
+          Stop-Process -Id $proc.Id -Force
+          Write-Host 'Guard stayed alive holding the request: OK'
+
+      - name: Launcher routes arguments without elevating read-only modes
+        shell: cmd
+        run: |
+          StayAwake.cmd -Status
+          if errorlevel 1 exit /b 1
+          echo Launcher OK
