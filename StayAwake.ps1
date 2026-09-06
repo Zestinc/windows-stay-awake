@@ -610,7 +610,9 @@ function Invoke-Apply {
         Write-Host ('⚠ {0}' -f $after.UserNote) -ForegroundColor Yellow
         Write-Host ''
     }
-    $policyConflicts = Get-ScreenSaverPolicyConflicts -UserHive $after.UserHive
+    # @() 是必须的：PowerShell 从函数返回集合时会把它展开，空集合会变成
+    # $null，随后 $null.Count 在 StrictMode 下直接抛错。
+    $policyConflicts = @(Get-ScreenSaverPolicyConflicts -UserHive $after.UserHive)
     if ($policyConflicts.Count -gt 0) {
         Write-Host '⚠ 检测到组策略配置，它优先于本工具修改的普通设置：' -ForegroundColor Yellow
         foreach ($c in $policyConflicts) { Write-Host ('  - {0}' -f $c) -ForegroundColor Yellow }
