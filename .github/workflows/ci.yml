@@ -260,8 +260,21 @@ jobs:
         env:
           STAYAWAKE_NO_PAUSE: '1'
         run: |
-          StayAwake.cmd -Status
-          if errorlevel 1 exit /b 1
+          rem `call` is required: invoking one .cmd from another without it
+          rem transfers control permanently, so every later line is skipped and
+          rem the assertions below would silently never run.
+          call StayAwake.cmd -Status > out.txt 2>&1
+          set "RC=%ERRORLEVEL%"
+          type out.txt
+          if not "%RC%"=="0" (
+            echo FAIL: launcher exited %RC%
+            exit /b 1
+          )
+          findstr /C:"[OK]" out.txt >nul || findstr /C:"[--]" out.txt >nul
+          if errorlevel 1 (
+            echo FAIL: launcher produced no status table
+            exit /b 1
+          )
           echo Launcher OK
 
       - name: Launcher survives arguments containing cmd metacharacters
@@ -275,11 +288,12 @@ jobs:
           rem comment must not contain the character it is describing.
           rem Nothing may execute here except the script, and the path must
           rem arrive intact.
-          StayAwake.cmd -Restore -BackupFile "%RUNNER_TEMP%\a & b\nope.json" > out.txt 2>&1
+          call StayAwake.cmd -Restore -BackupFile "%RUNNER_TEMP%\a & b\nope.json" > out.txt 2>&1
+          set "RC=%ERRORLEVEL%"
           echo --- script output ---
           type out.txt
           echo ---------------------
-          if not errorlevel 1 (
+          if "%RC%"=="0" (
             echo FAIL: expected a nonzero exit for a missing backup file
             exit /b 1
           )
@@ -293,6 +307,19 @@ jobs:
             exit /b 1
           )
           echo Metacharacter argument forwarded intact OK
+
+      - name: Launcher must not reimplement the elevation decision
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Static guard. The elevation decision lives in StayAwake.ps1, which can
+          # read the real parameter set and WindowsPrincipal; batch can only
+          # string-match the command line and that guess drifts.
+          $text = Get-Content .\StayAwake.cmd -Raw
+          if ($text -match '(?i)echo\s+%\*')     { throw 'Launcher pipes the argument list through echo' }
+          if ($text -match '(?i)-Verb\s+RunAs')  { throw 'Elevation belongs in StayAwake.ps1, not the launcher' }
+          if ($text -match '(?i)\bfltmc\b')      { throw 'Launcher is probing for admin rights again' }
+          Write-Host 'Launcher stayed a plain entry point: OK'
 
       - name: Already-elevated runs execute directly instead of re-launching
         shell: powershell
