@@ -22,8 +22,13 @@
 - Apply 和 `-Restore` 需要管理员，因为要写 `HKLM` 和全局电源方案。
 
 权限判断由 `StayAwake.ps1` 自己做（`WindowsPrincipal`），检测到需要提权时用
-`Start-Process -Verb RunAs` 以管理员身份重新拉起自己，参数由 `$PSBoundParameters`
-精确重建后经数组传递，不经过任何 cmd 转义。新窗口带 `-NoExit`，跑完结果还在。
+`Start-Process -Verb RunAs` 以管理员身份重新拉起自己。参数由 `$PSBoundParameters`
+重建，并**逐个按 Windows 命令行规则自行加引号**——`Start-Process -ArgumentList`
+收到数组时只是用空格拼接，不会替含空格的元素加引号，脚本装在 `C:\My Tools\` 下
+就会被拆碎。
+
+父进程用 `-Wait` 等待并透传子进程的退出码，所以提权后失败不会变成假的成功。
+提权出来的窗口带内部标记 `-Elevated`，结束前会停下来等按键，结果不会一闪而过。
 
 `StayAwake.cmd` 只是双击入口（双击 `.ps1` 会打开编辑器而不是执行），它**不**判断
 权限：批处理只能对命令行做字符串匹配来猜，这份猜测会和脚本真正的参数集解析漂移，
@@ -47,7 +52,7 @@
 - 空闲后关闭硬盘 → 从不
 - 屏幕保护程序 → 关闭
 - 不活动自动锁定（InactivityTimeoutSecs）→ 0
-- 动态锁（手机蓝牙走开就锁屏）→ 关闭
+- 动态锁（手机蓝牙走开就锁屏）→ 关闭。**用户开关和组策略两处都写**：设置界面里点的那个在用户 hive 的 `Winlogon` 下，只关组策略那个仍会锁屏
 - 休眠功能本身 → `powercfg /hibernate off`
 
 交流和电池两侧都会写。
@@ -71,16 +76,22 @@
 
 ## 备份与回滚
 
-每次 Apply 都会先把每一项的原值（含“原本就未设置”这个状态）写进：
+每次 Apply 都会先把每一项的原值写进：
 
 ```
-%ProgramData%\StayAwake\backup-<时间戳>.json
-%ProgramData%\StayAwake\backup-latest.json
+%ProgramData%\StayAwake\backup-<时间戳>.json   每次一份历史
+%ProgramData%\StayAwake\backup-latest.json     最近一次
+%ProgramData%\StayAwake\backup-pristine.json   本工具第一次动手之前的状态
 ```
 
-`-Restore` 默认读 `backup-latest.json`，也可以 `-Restore -BackupFile <路径>` 指定任意一次。原本未设置的项会被删除而不是写 0，回到电源方案的默认值。
+`pristine` 只创建一次，后续 Apply 绝不覆盖它——只在覆盖面扩大时（例如先跑预设层、
+后来又加了 `-DisableLockScreen`）把新增项的原值补录进去。
 
-回滚同样逐项读回验证，不一致就以退出码 1 失败。
+**`-Restore` 默认回滚到 `pristine`**，成功后删除它，下次 Apply 重新记录。
+`backup-latest` 在连续 Apply 之后记的是已经被改过的中间态，拿它回滚回不到原点。
+`-Restore -BackupFile <路径>` 可以指定任意一次历史备份；显式指定时不会删除该文件。
+
+回滚按备份里记录的路径逐项读回验证，不一致就以退出码 1 失败。
 
 ## 验证
 
@@ -96,7 +107,9 @@ Apply 和 Restore 都不会只打印“已完成”：写完后重新读一遍�
 
 ## 已知边界
 
-- 提权后 `HKCU` 指向管理员账户而不是正在用这台机器的人。脚本会通过 `Win32_ComputerSystem.UserName` 解析交互登录用户的 SID，改写 `HKEY_USERS\<SID>` 下的屏保设置。无人交互登录时（例如纯 SSH 会话）回落到当前用户，并在 `-Status` 的“目标用户”一行标注。
+- 提权后 `HKCU` 指向管理员账户而不是正在用这台机器的人。脚本会通过 `Win32_ComputerSystem.UserName` 解析交互登录用户的 SID，改写 `HKEY_USERS\<SID>` 下的屏保设置。**解析失败时（无人交互登录、SID 解析不出、用户 hive 未加载）会回落到当前账户并打出显式警告**——这种情况下读回验证仍会通过，但改的不是那个人的设置，警告是唯一能看出这件事的线索。多用户同时登录（控制台 + 远程桌面）时 `UserName` 只返回控制台用户，同样以警告为准。
+- **组策略优先于普通设置**。域里或本机组策略强制启用了屏保时，只改 `Control Panel\Desktop` 不生效，而读回普通位置却会显示成功。脚本会检测 `Software\Policies\...\Control Panel\Desktop` 下的冲突项并如实报告，但不会去写组策略缓存——那会被下一次 `gpupdate` 覆盖，制造比不改更糟的假象。看到这个警告就得去 `gpedit.msc` 或域策略里关。
+- `-Guard` 也压不住组策略强制的屏保：`SetThreadExecutionState` 只影响空闲计时，不影响策略驱动的屏保和锁定。
 - 只作用于**当前活动的电源方案**。切换电源方案后需要重新运行。
 - 设置项通过注册表读回，不解析 `powercfg` 的文字输出——后者在中文系统上是中文的，按英文关键字解析会静默失配。
 - 回滚恢复的是**有效值**而不是注册表键的存在性：`powercfg` 没有「取消设置」这个操作，删掉键之后 `/setactive` 会立刻按当前生效值把它重建。方案键里缺项时，备份记录的是该项的方案默认值。

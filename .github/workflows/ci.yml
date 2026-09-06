@@ -258,12 +258,22 @@ jobs:
             if ($null -eq $i -or $i.PSObject.Properties.Name -notcontains $n) { return $null }
             return $i.$n
           }
+          # Seed non-default originals first. A clean runner has these unset, so
+          # without seeding the test would only prove "null restored to null"
+          # and could not falsify a restore that writes the wrong value. Real
+          # machines almost always have concrete values here.
+          if (-not (Test-Path $personalization)) { New-Item -Path $personalization -Force | Out-Null }
+          New-ItemProperty -Path $personalization -Name 'NoLockScreen' -Value 0 -PropertyType DWord -Force | Out-Null
+          New-ItemProperty -Path $policySystem -Name 'DisableLockWorkstation' -Value 0 -PropertyType DWord -Force | Out-Null
+          New-ItemProperty -Path $policySystem -Name 'InactivityTimeoutSecs' -Value 900 -PropertyType DWord -Force | Out-Null
+
           $before = @{
             NoLockScreen = Get-Val $personalization 'NoLockScreen'
             WinL         = Get-Val $policySystem 'DisableLockWorkstation'
             Inactivity   = Get-Val $policySystem 'InactivityTimeoutSecs'
           }
           Write-Host "  before: $($before | ConvertTo-Json -Compress)"
+          if ("$($before.Inactivity)" -ne '900') { throw 'Seeding the original values failed' }
 
           .\StayAwake.ps1 -DisableLockScreen | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "opt-in apply exited $LASTEXITCODE" }
