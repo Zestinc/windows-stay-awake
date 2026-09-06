@@ -142,19 +142,35 @@ jobs:
           .\StayAwake.ps1 -Restore -BackupFile $first.FullName
           if ($LASTEXITCODE -ne 0) { throw "Restore exited $LASTEXITCODE" }
 
+          # Restore recovers the effective value, not the presence of a registry
+          # key: powercfg has no "unset", and /setactive rebuilds a deleted key.
           $backup = Get-Content $first.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
           $scheme = $backup.Scheme
+          $checked = 0
           foreach ($item in ($backup.Items | Where-Object { $_.Kind -eq 'power' })) {
+            if ($null -eq $item.AC -and $null -eq $item.DC) { continue }
             $p = "HKLM:\SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes\$scheme\$($item.Sub)\$($item.Setting)"
-            if ($null -eq $item.AC -and $null -eq $item.DC) {
-              if (Test-Path $p) { throw "$($item.Key): expected the key to be removed, it still exists" }
-              continue
-            }
             $v = Get-ItemProperty -Path $p -ErrorAction Stop
-            if ("$($v.ACSettingIndex)" -ne "$($item.AC)") { throw "$($item.Key) AC = $($v.ACSettingIndex), expected $($item.AC)" }
-            if ("$($v.DCSettingIndex)" -ne "$($item.DC)") { throw "$($item.Key) DC = $($v.DCSettingIndex), expected $($item.DC)" }
+            if ($null -ne $item.AC -and "$($v.ACSettingIndex)" -ne "$($item.AC)") { throw "$($item.Key) AC = $($v.ACSettingIndex), expected $($item.AC)" }
+            if ($null -ne $item.DC -and "$($v.DCSettingIndex)" -ne "$($item.DC)") { throw "$($item.Key) DC = $($v.DCSettingIndex), expected $($item.DC)" }
+            $checked++
           }
-          Write-Host 'Restore verified against the pristine backup: OK'
+          if ($checked -lt 5) { throw "Only $checked power settings were verified; the backup looks empty" }
+          Write-Host "Restore verified against the pristine backup ($checked settings): OK"
+
+      - name: Backed-up values are effective values, never null
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Regression guard: an earlier version recorded "unset" for keys that
+          # were merely absent, then tried to roll back by deleting the key.
+          $latest = Get-Content "$env:ProgramData\StayAwake\backup-latest.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+          foreach ($item in ($latest.Items | Where-Object { $_.Kind -eq 'power' })) {
+            if ($null -eq $item.AC -or $null -eq $item.DC) {
+              throw "$($item.Key) backed up as null (Source=$($item.Source)); expected a resolved effective value"
+            }
+          }
+          Write-Host 'Every power setting backed up with a concrete effective value: OK'
 
       - name: Hibernate toggle is best-effort, not a hard dependency
         shell: powershell

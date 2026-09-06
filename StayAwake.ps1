@@ -201,18 +201,13 @@ function Get-ActiveSchemeGuid {
     return $m.Value
 }
 
-function Get-PowerValue {
-    <#
-        直接读注册表而不是解析 powercfg 的文字输出——后者在中文系统上是中文的，
-        按英文关键字解析会静默失配。返回 $null 表示该项未被显式设置（使用默认值）。
-    #>
-    param([string]$Scheme, [string]$Sub, [string]$Setting)
+$script:SCHEME_BALANCED = '381b4222-f694-41f0-9685-ff5bb260df2e'
 
-    $path = "HKLM:\SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes\$Scheme\$Sub\$Setting"
+function Read-SettingIndexes {
+    param([string]$Path)
     $result = @{ AC = $null; DC = $null }
-    if (-not (Test-Path $path)) { return $result }
-
-    $item = Get-ItemProperty -Path $path -ErrorAction SilentlyContinue
+    if (-not (Test-Path $Path)) { return $result }
+    $item = Get-ItemProperty -Path $Path -ErrorAction SilentlyContinue
     if ($null -eq $item) { return $result }
     foreach ($side in @('AC', 'DC')) {
         $prop = "${side}SettingIndex"
@@ -221,6 +216,42 @@ function Get-PowerValue {
         }
     }
     return $result
+}
+
+function Get-PowerValue {
+    <#
+        返回该设置项当前的“有效值”。
+
+        直接读注册表而不是解析 powercfg 的文字输出——后者在中文系统上是中文的，
+        按英文关键字解析会静默失配。
+
+        方案键里没有这一项时并不代表“没有值”，而是沿用方案默认值。回滚要恢复的
+        是机器的行为，不是注册表键的存在性——何况 powercfg 没有“取消设置”这个
+        操作，删掉键之后 /setactive 会立刻把它重建。所以这里向下回落到默认值，
+        Restore 再把这个有效值原样写回去。
+    #>
+    param([string]$Scheme, [string]$Sub, [string]$Setting)
+
+    $schemePath = "HKLM:\SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes\$Scheme\$Sub\$Setting"
+    $v = Read-SettingIndexes -Path $schemePath
+    if ($null -ne $v.AC -and $null -ne $v.DC) {
+        return @{ AC = $v.AC; DC = $v.DC; Source = 'scheme' }
+    }
+
+    # 回落：先查这个方案的默认值，自定义方案查不到时退回“平衡”模板。
+    foreach ($src in @($Scheme, $script:SCHEME_BALANCED)) {
+        $defPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerSettings\$Sub\$Setting\DefaultPowerSchemeValues\$src"
+        $d = Read-SettingIndexes -Path $defPath
+        if ($null -ne $d.AC -or $null -ne $d.DC) {
+            return @{
+                AC     = $(if ($null -ne $v.AC) { $v.AC } else { $d.AC })
+                DC     = $(if ($null -ne $v.DC) { $v.DC } else { $d.DC })
+                Source = 'default'
+            }
+        }
+    }
+
+    return @{ AC = $v.AC; DC = $v.DC; Source = 'unknown' }
 }
 
 function Get-RegValue {
@@ -271,7 +302,7 @@ function Get-CurrentState {
         [void]$items.Add([pscustomobject]@{
             Kind = 'power'; Key = $s.Key; Label = $s.Label; Tier = $s.Tier
             Sub = $s.Sub; Setting = $s.Setting; Target = $s.Target
-            AC = $v.AC; DC = $v.DC
+            AC = $v.AC; DC = $v.DC; Source = $v.Source
         })
     }
 
@@ -442,13 +473,8 @@ function Invoke-Restore {
     $scheme = $backup.Scheme
     foreach ($item in $backup.Items) {
         if ($item.Kind -eq 'power') {
-            # 原值为 null 表示当时未显式设置；powercfg 没有“取消设置”，
-            # 直接删掉注册表项让它回到方案默认。
-            if ($null -eq $item.AC -and $null -eq $item.DC) {
-                $p = "HKLM:\SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes\$scheme\$($item.Sub)\$($item.Setting)"
-                if (Test-Path $p) { Remove-Item -Path $p -Force -Recurse -ErrorAction SilentlyContinue }
-                continue
-            }
+            # 备份里存的是有效值（键缺失时已回落到方案默认值），原样写回即可。
+            # 读不到有效值的项（Source = unknown）当时就没被改过，跳过。
             if ($null -ne $item.AC) { [void](Invoke-PowerCfg -Arguments @('/setacvalueindex', $scheme, $item.Sub, $item.Setting, "$($item.AC)")) }
             if ($null -ne $item.DC) { [void](Invoke-PowerCfg -Arguments @('/setdcvalueindex', $scheme, $item.Sub, $item.Setting, "$($item.DC)")) }
         } else {
@@ -478,8 +504,9 @@ function Invoke-Restore {
         $now = $after.Items | Where-Object { $_.Key -eq $item.Key } | Select-Object -First 1
         if ($null -eq $now) { continue }
         if ($item.Kind -eq 'power') {
-            if ([string]$now.AC -ne [string]$item.AC) { [void]$failures.Add("$($item.Label) 交流侧 = $(Format-Value $now.AC)，期望 $(Format-Value $item.AC)") }
-            if ([string]$now.DC -ne [string]$item.DC) { [void]$failures.Add("$($item.Label) 电池侧 = $(Format-Value $now.DC)，期望 $(Format-Value $item.DC)") }
+            # 备份时就读不到有效值的项当时没被改过，也无从声称回滚了它。
+            if ($null -ne $item.AC -and [string]$now.AC -ne [string]$item.AC) { [void]$failures.Add("$($item.Label) 交流侧 = $(Format-Value $now.AC)，期望 $(Format-Value $item.AC)") }
+            if ($null -ne $item.DC -and [string]$now.DC -ne [string]$item.DC) { [void]$failures.Add("$($item.Label) 电池侧 = $(Format-Value $now.DC)，期望 $(Format-Value $item.DC)") }
         } else {
             if ([string]$now.Value -ne [string]$item.Value) { [void]$failures.Add("$($item.Label) = $(Format-Value $now.Value)，期望 $(Format-Value $item.Value)") }
         }
