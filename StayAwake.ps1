@@ -578,5 +578,11 @@ try {
 } catch {
     Write-Host ''
     Write-Host ('错误: {0}' -f $_.Exception.Message) -ForegroundColor Red
+    if ($_.InvocationInfo -and $_.InvocationInfo.PositionMessage) {
+        Write-Host $_.InvocationInfo.PositionMessage -ForegroundColor DarkRed
+    }
+    if ($_.Exception.InnerException) {
+        Write-Host ('内层错误: {0}' -f $_.Exception.InnerException.Message) -ForegroundColor DarkRed
+    }
     exit 2
 }

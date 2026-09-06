@@ -219,10 +219,17 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:RUNNER_TEMP 'guard-out.txt'
+          $err = Join-Path $env:RUNNER_TEMP 'guard-err.txt'
           $proc = Start-Process powershell -PassThru -WindowStyle Hidden `
+            -RedirectStandardOutput $out -RedirectStandardError $err `
             -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','.\StayAwake.ps1','-Guard'
           Start-Sleep -Seconds 12
-          if ($proc.HasExited) { throw "Guard exited early with code $($proc.ExitCode)" }
+          if ($proc.HasExited) {
+            Write-Host '--- guard stdout ---'; Get-Content $out -ErrorAction SilentlyContinue | Write-Host
+            Write-Host '--- guard stderr ---'; Get-Content $err -ErrorAction SilentlyContinue | Write-Host
+            throw "Guard exited early with code $($proc.ExitCode)"
+          }
 
           # powercfg /requests names the requesting process when a request is held.
           $requests = & powercfg /requests | Out-String
