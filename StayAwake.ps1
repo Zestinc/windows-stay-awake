@@ -58,7 +58,11 @@ param(
 
     [Parameter(ParameterSetName = 'Apply')]
     [Parameter(ParameterSetName = 'Restore')]
-    [string]$BackupFile
+    [string]$BackupFile,
+
+    # 内部使用：标记本进程是被自己提权拉起来的，结束前要停住让人看到结果。
+    # 不要手工传。
+    [switch]$Elevated
 )
 
 Set-StrictMode -Version 2.0
@@ -93,7 +97,11 @@ $script:RegSettings = @(
     @{ Key = 'ScreenSaveActive';    Path = '<USERHIVE>\Control Panel\Desktop';                                     Name = 'ScreenSaveActive';     Target = '0'; Type = 'String'; Label = '屏幕保护程序';         Tier = 'preset' }
     @{ Key = 'ScreenSaveTimeOut';   Path = '<USERHIVE>\Control Panel\Desktop';                                     Name = 'ScreenSaveTimeOut';    Target = '0'; Type = 'String'; Label = '屏保等待时间';         Tier = 'preset' }
     @{ Key = 'InactivityTimeout';   Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System';      Name = 'InactivityTimeoutSecs'; Target = 0;  Type = 'DWord';  Label = '不活动自动锁定';       Tier = 'preset' }
-    @{ Key = 'DynamicLock';         Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsLogon';               Name = 'EnableGoodbye';        Target = 0;   Type = 'DWord';  Label = '动态锁（蓝牙走开即锁）'; Tier = 'preset' }
+    # 动态锁有两个开关：用户在“设置”里点的那个在用户 hive 的 Winlogon 下，
+    # 组策略那个在 HKLM Policies 下。只写其中一个都可能留下仍会锁屏的路径，
+    # 两个都写。
+    @{ Key = 'DynamicLockUser';     Path = '<USERHIVE>\Software\Microsoft\Windows NT\CurrentVersion\Winlogon';    Name = 'EnableGoodbye';        Target = 0;   Type = 'DWord';  Label = '动态锁（用户开关）';   Tier = 'preset' }
+    @{ Key = 'DynamicLockPolicy';   Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsLogon';               Name = 'EnableGoodbye';        Target = 0;   Type = 'DWord';  Label = '动态锁（组策略）';     Tier = 'preset' }
     @{ Key = 'ScreenSaverIsSecure'; Path = '<USERHIVE>\Control Panel\Desktop';                                     Name = 'ScreenSaverIsSecure';  Target = '0'; Type = 'String'; Label = '屏保恢复需要密码';     Tier = 'lockscreen' }
     @{ Key = 'NoLockScreen';        Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization';            Name = 'NoLockScreen';         Target = 1;   Type = 'DWord';  Label = '锁屏界面';             Tier = 'lockscreen' }
     @{ Key = 'DisableLockWorkstation'; Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System';   Name = 'DisableLockWorkstation'; Target = 1; Type = 'DWord';  Label = '手动锁定 (Win+L)';     Tier = 'lockscreen' }
@@ -107,6 +115,25 @@ function Test-Administrator {
     $id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object System.Security.Principal.WindowsPrincipal($id)
     return $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function ConvertTo-CommandLineArgument {
+    <#
+        按 Windows 命令行规则引用单个参数。
+
+        Start-Process -ArgumentList 收到数组时只是用空格拼接，**不会**替含空格的
+        元素加引号。脚本装在 "C:\My Tools\" 下、或 -BackupFile 指向带空格的路径
+        时，子进程会因此拿到被拆碎的参数。
+        规则：内部的 " 要转义，且紧邻闭合引号的反斜杠必须加倍，否则会把引号转义掉。
+    #>
+    param([string]$Value)
+
+    if ($Value -eq '') { return '""' }
+    if ($Value -notmatch '[\s"]') { return $Value }
+
+    $escaped = [regex]::Replace($Value, '(\\*)"', '$1$1\"')
+    $escaped = [regex]::Replace($escaped, '(\\+)$', '$1$1')
+    return '"' + $escaped + '"'
 }
 
 function Invoke-SelfElevate {
@@ -130,10 +157,11 @@ function Invoke-SelfElevate {
 
     $psExe = (Get-Process -Id $PID).Path
     $argList = New-Object System.Collections.ArrayList
-    foreach ($a in @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-NoExit', '-File', $PSCommandPath)) {
+    foreach ($a in @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath)) {
         [void]$argList.Add($a)
     }
     foreach ($kv in $BoundParameters.GetEnumerator()) {
+        if ($kv.Key -eq 'Elevated') { continue }
         if ($kv.Value -is [System.Management.Automation.SwitchParameter]) {
             if ($kv.Value.IsPresent) { [void]$argList.Add("-$($kv.Key)") }
         } else {
@@ -141,14 +169,20 @@ function Invoke-SelfElevate {
             [void]$argList.Add([string]$kv.Value)
         }
     }
+    [void]$argList.Add('-Elevated')
+
+    $commandLine = ($argList | ForEach-Object { ConvertTo-CommandLineArgument $_ }) -join ' '
 
     Write-Host '正在请求管理员权限…' -ForegroundColor Cyan
     try {
-        [void](Start-Process -FilePath $psExe -Verb RunAs -ArgumentList $argList.ToArray() -ErrorAction Stop)
+        # -Wait 才能把子进程的退出码带回来。没有它，提权后无论成败父进程都
+        # 立刻 exit 0，调用方（以及 .cmd 的 %ERRORLEVEL%）会收到假的成功。
+        $child = Start-Process -FilePath $psExe -Verb RunAs -ArgumentList $commandLine `
+                               -Wait -PassThru -ErrorAction Stop
     } catch {
         throw ('提权被取消或失败：{0}' -f $_.Exception.Message)
     }
-    Write-Host '已在新的管理员窗口中继续，本窗口可以关闭。' -ForegroundColor Green
+    return $child.ExitCode
 }
 
 function Get-InteractiveUserHive {
@@ -163,23 +197,65 @@ function Get-InteractiveUserHive {
         $userName = $null
     }
 
+    $self = "$env:USERDOMAIN\$env:USERNAME"
+
     if ([string]::IsNullOrWhiteSpace($userName)) {
-        # 无人交互登录（例如仅 SSH 会话）：只能退回当前进程的 HKCU。
-        return @('HKCU:', "$env:USERDOMAIN\$env:USERNAME (无交互登录会话，回落到当前用户)")
+        return [pscustomobject]@{
+            Hive = 'HKCU:'; Account = $self; Resolved = $false
+            Note = '没有检测到交互登录会话，只能改当前账户；若实际有人在用桌面，其屏保设置不会被改到'
+        }
+    }
+
+    if ($userName -eq $self) {
+        return [pscustomobject]@{ Hive = 'HKCU:'; Account = $userName; Resolved = $true; Note = $null }
     }
 
     try {
         $account = New-Object System.Security.Principal.NTAccount($userName)
         $sid = $account.Translate([System.Security.Principal.SecurityIdentifier]).Value
     } catch {
-        return @('HKCU:', "$userName (SID 解析失败，回落到当前用户)")
+        return [pscustomobject]@{
+            Hive = 'HKCU:'; Account = $self; Resolved = $false
+            Note = "无法解析登录用户 $userName 的 SID，改的是 $self；$userName 的屏保设置不会被改到"
+        }
     }
 
     $hive = "Registry::HKEY_USERS\$sid"
     if (-not (Test-Path $hive)) {
-        return @('HKCU:', "$userName (用户 hive 未加载，回落到当前用户)")
+        return [pscustomobject]@{
+            Hive = 'HKCU:'; Account = $self; Resolved = $false
+            Note = "登录用户 $userName 的注册表 hive 未加载，改的是 $self；$userName 的屏保设置不会被改到"
+        }
     }
-    return @($hive, $userName)
+    return [pscustomobject]@{ Hive = $hive; Account = $userName; Resolved = $true; Note = $null }
+}
+
+function Get-ScreenSaverPolicyConflicts {
+    <#
+        组策略位置优先于普通的 Control Panel\Desktop。域里（或本机组策略里）
+        强制开了屏保时，只改普通位置不会生效，而读回普通位置却会显示成功。
+        这里只做检测和如实报告：写组策略缓存在域环境下会被下一次 gpupdate
+        覆盖，制造“改好了”的假象，比不改更糟。
+    #>
+    param([string]$UserHive)
+
+    $conflicts = New-Object System.Collections.ArrayList
+    $policyPath = "$UserHive\Software\Policies\Microsoft\Windows\Control Panel\Desktop"
+    $checks = @(
+        @{ Name = 'ScreenSaveActive';    Bad = '1'; Label = '组策略强制启用了屏幕保护程序' }
+        @{ Name = 'ScreenSaverIsSecure'; Bad = '1'; Label = '组策略强制屏保恢复时需要密码' }
+    )
+    foreach ($c in $checks) {
+        $v = Get-RegValue -Path $policyPath -Name $c.Name
+        if ($null -ne $v -and [string]$v -eq $c.Bad) {
+            [void]$conflicts.Add(('{0}（{1}\{2} = {3}），本工具改的普通设置会被它压过' -f $c.Label, $policyPath, $c.Name, $v))
+        }
+    }
+    $timeout = Get-RegValue -Path $policyPath -Name 'ScreenSaveTimeOut'
+    if ($null -ne $timeout -and [int]$timeout -gt 0) {
+        [void]$conflicts.Add(('组策略设定了屏保等待时间 {0} 秒（{1}\ScreenSaveTimeOut）' -f $timeout, $policyPath))
+    }
+    return $conflicts
 }
 
 function Resolve-RegPath {
@@ -281,19 +357,24 @@ function Get-PowerValue {
     }
 
     # 回落：先查这个方案的默认值，自定义方案查不到时退回“平衡”模板。
+    # 两侧必须各自独立回落——某个来源只提供 AC 默认值时，不能就此收工把 DC
+    # 留成 null：Apply 照样会把 DC 写成 0，而 Restore 见到 null 会跳过，
+    # 那一侧就永远回不去了。
+    $ac = $v.AC
+    $dc = $v.DC
+    $usedDefault = $false
     foreach ($src in @($Scheme, $script:SCHEME_BALANCED)) {
+        if ($null -ne $ac -and $null -ne $dc) { break }
         $defPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerSettings\$Sub\$Setting\DefaultPowerSchemeValues\$src"
         $d = Read-SettingIndexes -Path $defPath
-        if ($null -ne $d.AC -or $null -ne $d.DC) {
-            return @{
-                AC     = $(if ($null -ne $v.AC) { $v.AC } else { $d.AC })
-                DC     = $(if ($null -ne $v.DC) { $v.DC } else { $d.DC })
-                Source = 'default'
-            }
-        }
+        if ($null -eq $ac -and $null -ne $d.AC) { $ac = $d.AC; $usedDefault = $true }
+        if ($null -eq $dc -and $null -ne $d.DC) { $dc = $d.DC; $usedDefault = $true }
     }
 
-    return @{ AC = $v.AC; DC = $v.DC; Source = 'unknown' }
+    $source = if ($null -eq $ac -or $null -eq $dc) { 'unknown' }
+              elseif ($usedDefault) { 'default' }
+              else { 'scheme' }
+    return @{ AC = $ac; DC = $dc; Source = $source }
 }
 
 function Get-RegValue {
@@ -333,7 +414,7 @@ function Get-CurrentState {
 
     $scheme = Get-ActiveSchemeGuid
     $hiveInfo = Get-InteractiveUserHive
-    $userHive = $hiveInfo[0]
+    $userHive = $hiveInfo.Hive
     $tiers = if ($IncludeLockScreen) { @('preset', 'lockscreen') } else { @('preset') }
 
     $items = New-Object System.Collections.ArrayList
@@ -361,7 +442,9 @@ function Get-CurrentState {
     return [pscustomobject]@{
         Scheme            = $scheme
         UserHive          = $userHive
-        UserAccount       = $hiveInfo[1]
+        UserAccount       = $hiveInfo.Account
+        UserResolved      = $hiveInfo.Resolved
+        UserNote          = $hiveInfo.Note
         HibernateEnabled  = (Get-HibernateEnabled)
         Items             = $items
     }
@@ -377,6 +460,9 @@ function Show-Status {
     Write-Host ('  目标用户 : {0}' -f $state.UserAccount)
     $hib = if ($null -eq $state.HibernateEnabled) { '(不支持/未知)' } elseif ([int]$state.HibernateEnabled -eq 1) { '已启用' } else { '已关闭' }
     Write-Host ('  休眠功能 : {0}' -f $hib)
+    if (-not $state.UserResolved -and $state.UserNote) {
+        Write-Host ('  ⚠ {0}' -f $state.UserNote) -ForegroundColor Yellow
+    }
     Write-Host ''
 
     foreach ($item in $state.Items) {
@@ -411,7 +497,8 @@ function Invoke-Apply {
     # ---- 1. 先备份，再改 ----
     if (-not (Test-Path $script:StateDir)) { New-Item -Path $script:StateDir -ItemType Directory -Force | Out-Null }
     if ([string]::IsNullOrWhiteSpace($BackupPath)) {
-        $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+        # 毫秒精度：同一秒内连跑两次不会互相覆盖历史备份。
+        $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
         $BackupPath = Join-Path $script:StateDir "backup-$stamp.json"
     }
     $backup = [pscustomobject]@{
@@ -427,19 +514,36 @@ function Invoke-Apply {
     Copy-Item -Path $BackupPath -Destination (Join-Path $script:StateDir 'backup-latest.json') -Force
     Write-Host ('已备份原值 -> {0}' -f $BackupPath) -ForegroundColor DarkGray
 
+    # pristine：本工具第一次动手之前的状态，只创建一次，绝不被后续 Apply 覆盖。
+    # 没有它的话，「先 -DisableLockScreen 再跑一次预设层」这种连续 Apply 会把
+    # 备份刷成已被改过的中间态，认证层的原值就永久丢了，之后 Restore 会成功
+    # 退出但唤醒密码仍是关的。
+    $pristinePath = Join-Path $script:StateDir 'backup-pristine.json'
+    if (Test-Path $pristinePath) {
+        # 已有 pristine，但本次可能覆盖了它没记录的层（例如它只记了预设层，
+        # 这次带上了 -DisableLockScreen）。那些项此刻还没被本次写入改动，
+        # 现在的值就是它们的原值，补进去。
+        $pristine = Get-Content -Path $pristinePath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $known = @($pristine.Items | ForEach-Object { $_.Key })
+        $missing = @($before.Items | Where-Object { $known -notcontains $_.Key })
+        if ($missing.Count -gt 0) {
+            $pristine.Items = @($pristine.Items) + $missing
+            $pristine | ConvertTo-Json -Depth 6 | Set-Content -Path $pristinePath -Encoding UTF8
+            Write-Host ('  已把 {0} 个新增项的原值并入 pristine 备份' -f $missing.Count) -ForegroundColor DarkGray
+        }
+    } else {
+        $backup | ConvertTo-Json -Depth 6 | Set-Content -Path $pristinePath -Encoding UTF8
+    }
+
     # ---- 2. 写入 ----
-    # 区分两种“没成功”：
-    #   skipped — 这台机器不支持该设置项，属于能力边界，不阻止其余项生效。
-    #   failure — 写进去了但读回不符，那是真问题（被策略覆盖或本脚本有 bug）。
     $scheme = $before.Scheme
-    $skipped = New-Object System.Collections.ArrayList
+    $writeErrors = @{}
     foreach ($item in $before.Items) {
         if ($item.Kind -eq 'power') {
             $ac = Invoke-PowerCfg -Arguments @('/setacvalueindex', $scheme, $item.Sub, $item.Setting, "$($item.Target)")
             $dc = Invoke-PowerCfg -Arguments @('/setdcvalueindex', $scheme, $item.Sub, $item.Setting, "$($item.Target)")
             if ($ac.ExitCode -ne 0 -or $dc.ExitCode -ne 0) {
-                $msg = if ($ac.ExitCode -ne 0) { $ac.Output } else { $dc.Output }
-                [void]$skipped.Add([pscustomobject]@{ Key = $item.Key; Label = $item.Label; Reason = $msg })
+                $writeErrors[$item.Key] = $(if ($ac.ExitCode -ne 0) { $ac.Output } else { $dc.Output })
             }
         } else {
             Set-RegValue -Path $item.Path -Name $item.Name -Value $item.Target -Type $item.Type
@@ -454,14 +558,31 @@ function Invoke-Apply {
     [void](Set-HibernateBestEffort -State 'off')
 
     # ---- 3. 读回验证 ----
+    # 判据以读回结果为准，写入时的退出码只是线索。三分：
+    #   通过     — 读回等于目标值。
+    #   skipped  — 读回不等，且系统的 PowerSettings 下根本没有这个设置项，
+    #              属于真正的机器能力边界。
+    #   failure  — 读回不等，但系统认识这个设置项。那是权限不足、被策略覆盖
+    #              或本脚本有 bug，绝不能当成“不支持”然后返回成功。
     $after = Get-CurrentState -IncludeLockScreen:$IncludeLockScreen
-    $skippedKeys = @($skipped | ForEach-Object { $_.Key })
+    $skipped = New-Object System.Collections.ArrayList
     $failures = New-Object System.Collections.ArrayList
     foreach ($item in $after.Items) {
-        if ($skippedKeys -contains $item.Key) { continue }
         if ($item.Kind -eq 'power') {
-            if ($item.AC -ne $item.Target) { [void]$failures.Add("$($item.Label) 交流侧读回 = $(Format-Value $item.AC)，期望 $($item.Target)") }
-            if ($item.DC -ne $item.Target) { [void]$failures.Add("$($item.Label) 电池侧读回 = $(Format-Value $item.DC)，期望 $($item.Target)") }
+            $bad = New-Object System.Collections.ArrayList
+            if ($item.AC -ne $item.Target) { [void]$bad.Add("交流侧 = $(Format-Value $item.AC)") }
+            if ($item.DC -ne $item.Target) { [void]$bad.Add("电池侧 = $(Format-Value $item.DC)") }
+            if ($bad.Count -eq 0) { continue }
+
+            $supported = Test-Path "HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerSettings\$($item.Sub)\$($item.Setting)"
+            $detail = ($bad -join '，')
+            if (-not $supported) {
+                $reason = if ($writeErrors.ContainsKey($item.Key)) { $writeErrors[$item.Key] } else { '这台机器没有这个电源设置项' }
+                [void]$skipped.Add([pscustomobject]@{ Key = $item.Key; Label = $item.Label; Reason = $reason })
+            } else {
+                $extra = if ($writeErrors.ContainsKey($item.Key)) { "；powercfg: $($writeErrors[$item.Key])" } else { '' }
+                [void]$failures.Add("$($item.Label) $detail，期望 $($item.Target)$extra")
+            }
         } else {
             if ([string]$item.Value -ne [string]$item.Target) { [void]$failures.Add("$($item.Label) 读回 = $(Format-Value $item.Value)，期望 $($item.Target)") }
         }
@@ -474,12 +595,26 @@ function Invoke-Apply {
         foreach ($f in $failures) { Write-Host "  - $f" -ForegroundColor Red }
         Write-Host ''
         Write-Host ('可用 .\StayAwake.ps1 -Restore -BackupFile "{0}" 回滚。' -f $BackupPath) -ForegroundColor Yellow
-        exit 1
+        $script:ExitCode = 1
+        return
     }
 
     if ($skipped.Count -gt 0) {
         Write-Host '这台机器不支持以下设置项，已跳过（其余项已生效）：' -ForegroundColor Yellow
         foreach ($s in $skipped) { Write-Host ('  - {0}: {1}' -f $s.Label, $s.Reason) -ForegroundColor Yellow }
+        Write-Host ''
+    }
+
+    # 验证通过不代表目标达成：改错了账户、或被组策略压过，读回都会显示成功。
+    if (-not $after.UserResolved -and $after.UserNote) {
+        Write-Host ('⚠ {0}' -f $after.UserNote) -ForegroundColor Yellow
+        Write-Host ''
+    }
+    $policyConflicts = Get-ScreenSaverPolicyConflicts -UserHive $after.UserHive
+    if ($policyConflicts.Count -gt 0) {
+        Write-Host '⚠ 检测到组策略配置，它优先于本工具修改的普通设置：' -ForegroundColor Yellow
+        foreach ($c in $policyConflicts) { Write-Host ('  - {0}' -f $c) -ForegroundColor Yellow }
+        Write-Host '  屏保可能仍会启动。请在组策略（gpedit.msc / 域策略）里关闭对应项。' -ForegroundColor Yellow
         Write-Host ''
     }
 
@@ -502,8 +637,18 @@ function Invoke-Restore {
         throw '需要管理员权限。请用 StayAwake.cmd -Restore 启动，或在管理员 PowerShell 中运行。'
     }
 
+    # 默认回滚到 pristine——它记的是本工具第一次动手之前的状态。
+    # backup-latest 在连续 Apply 之后记的是「已经被改过的状态」，拿它回滚
+    # 等于回到中间态。
+    $usingPristine = $false
     if ([string]::IsNullOrWhiteSpace($BackupPath)) {
-        $BackupPath = Join-Path $script:StateDir 'backup-latest.json'
+        $pristinePath = Join-Path $script:StateDir 'backup-pristine.json'
+        if (Test-Path $pristinePath) {
+            $BackupPath = $pristinePath
+            $usingPristine = $true
+        } else {
+            $BackupPath = Join-Path $script:StateDir 'backup-latest.json'
+        }
     }
     if (-not (Test-Path $BackupPath)) {
         throw "找不到备份文件: $BackupPath"
@@ -539,28 +684,35 @@ function Invoke-Restore {
         [void](Set-HibernateBestEffort -State $(if ([int]$hadHibernate -eq 1) { 'on' } else { 'off' }))
     }
 
-    # 读回验证：每一项都必须回到备份里的原值
-    $after = Get-CurrentState -IncludeLockScreen:([bool]$backup.IncludeLockScreen)
+    # 读回验证：直接按备份里记录的路径读，不重新解析「当前交互用户」。
+    # 备份写的是 A 的 hive，若此刻登录的是 B，重新解析会去比 B 的值，
+    # A 明明恢复正确也会报失败（反之则会漏报）。
     $failures = New-Object System.Collections.ArrayList
     foreach ($item in $backup.Items) {
-        $now = $after.Items | Where-Object { $_.Key -eq $item.Key } | Select-Object -First 1
-        if ($null -eq $now) { continue }
         if ($item.Kind -eq 'power') {
+            $now = Get-PowerValue -Scheme $scheme -Sub $item.Sub -Setting $item.Setting
             # 备份时就读不到有效值的项当时没被改过，也无从声称回滚了它。
             if ($null -ne $item.AC -and [string]$now.AC -ne [string]$item.AC) { [void]$failures.Add("$($item.Label) 交流侧 = $(Format-Value $now.AC)，期望 $(Format-Value $item.AC)") }
             if ($null -ne $item.DC -and [string]$now.DC -ne [string]$item.DC) { [void]$failures.Add("$($item.Label) 电池侧 = $(Format-Value $now.DC)，期望 $(Format-Value $item.DC)") }
         } else {
-            if ([string]$now.Value -ne [string]$item.Value) { [void]$failures.Add("$($item.Label) = $(Format-Value $now.Value)，期望 $(Format-Value $item.Value)") }
+            $now = Get-RegValue -Path $item.Path -Name $item.Name
+            if ([string]$now -ne [string]$item.Value) { [void]$failures.Add("$($item.Label) = $(Format-Value $now)，期望 $(Format-Value $item.Value)") }
         }
     }
 
     if ($failures.Count -gt 0) {
         Write-Host '回滚验证未通过：' -ForegroundColor Red
         foreach ($f in $failures) { Write-Host "  - $f" -ForegroundColor Red }
-        exit 1
+        $script:ExitCode = 1
+        return
     }
 
-    Write-Host '已回滚到备份中的原始设置，并读回验证通过。' -ForegroundColor Green
+    Write-Host ('已回滚到备份中的原始设置（{0} 项），并读回验证通过。' -f $backup.Items.Count) -ForegroundColor Green
+
+    # pristine 已经用掉了：删掉它，下次 Apply 才会重新记录一份真实原值。
+    if ($usingPristine) {
+        Remove-Item -Path $BackupPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # ==========================================================================
@@ -610,15 +762,14 @@ public static extern uint SetThreadExecutionState(uint esFlags);
 # 入口
 # ==========================================================================
 
+$script:ExitCode = 0
+
 try {
     # -Status 与 -Guard 是只读/进程内的，不需要管理员；改配置的两条路要。
     $needsAdmin = -not ($Status -or $Guard)
     if ($needsAdmin -and -not (Test-Administrator)) {
-        Invoke-SelfElevate -BoundParameters $PSBoundParameters
-        exit 0
-    }
-
-    if ($Status) {
+        $script:ExitCode = Invoke-SelfElevate -BoundParameters $PSBoundParameters
+    } elseif ($Status) {
         Show-Status -IncludeLockScreen
     } elseif ($Restore) {
         Invoke-Restore -BackupPath $BackupFile
@@ -636,5 +787,15 @@ try {
     if ($_.Exception.InnerException) {
         Write-Host ('内层错误: {0}' -f $_.Exception.InnerException.Message) -ForegroundColor DarkRed
     }
-    exit 2
+    $script:ExitCode = 2
 }
+
+# 被自己提权拉起来的窗口是新开的，跑完就没了。停住让人看到结果，
+# 再把退出码交回父进程。
+if ($Elevated) {
+    Write-Host ''
+    Write-Host '按任意键关闭此窗口…' -ForegroundColor DarkGray
+    try { [void][System.Console]::ReadKey($true) } catch { Start-Sleep -Seconds 20 }
+}
+
+exit $script:ExitCode

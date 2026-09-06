@@ -134,12 +134,12 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          # The very first backup holds the pristine pre-test values.
-          $first = Get-ChildItem "$env:ProgramData\StayAwake\backup-*.json" |
-                   Where-Object { $_.Name -ne 'backup-latest.json' } |
-                   Sort-Object Name | Select-Object -First 1
-          Write-Host "Restoring from $($first.FullName)"
-          .\StayAwake.ps1 -Restore -BackupFile $first.FullName
+          # backup-pristine.json is created once and never overwritten, so it
+          # holds the values from before this tool first touched the machine.
+          $first = Join-Path $env:ProgramData 'StayAwake\backup-pristine.json'
+          if (-not (Test-Path $first)) { throw 'Apply did not create backup-pristine.json' }
+          Write-Host "Restoring from $first"
+          .\StayAwake.ps1 -Restore -BackupFile $first
           if ($LASTEXITCODE -ne 0) { throw "Restore exited $LASTEXITCODE" }
 
           # Restore recovers the effective value, not the presence of a registry
@@ -162,15 +162,22 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          # Regression guard: an earlier version recorded "unset" for keys that
-          # were merely absent, then tried to roll back by deleting the key.
-          $latest = Get-Content "$env:ProgramData\StayAwake\backup-latest.json" -Raw -Encoding UTF8 | ConvertFrom-Json
-          foreach ($item in ($latest.Items | Where-Object { $_.Kind -eq 'power' })) {
+          # Must check the pristine backup, not latest: by this point Apply has
+          # run several times, so latest records the already-written zeros and
+          # would mask a first-backup that lost an original value.
+          # Two regressions are guarded here: recording "unset" for keys that
+          # were merely absent, and the default-value fallback returning early
+          # after resolving only one side (leaving DC null, which Apply still
+          # overwrites and Restore then skips).
+          $pristine = Get-Content "$env:ProgramData\StayAwake\backup-pristine.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+          $power = @($pristine.Items | Where-Object { $_.Kind -eq 'power' })
+          if ($power.Count -lt 6) { throw "Pristine backup only has $($power.Count) power settings" }
+          foreach ($item in $power) {
             if ($null -eq $item.AC -or $null -eq $item.DC) {
-              throw "$($item.Key) backed up as null (Source=$($item.Source)); expected a resolved effective value"
+              throw "$($item.Key) backed up as null (AC=$($item.AC) DC=$($item.DC) Source=$($item.Source)); expected both sides resolved"
             }
           }
-          Write-Host 'Every power setting backed up with a concrete effective value: OK'
+          Write-Host "Every power setting backed up with concrete AC and DC values ($($power.Count) settings): OK"
 
       - name: Hibernate toggle is best-effort, not a hard dependency
         shell: powershell
@@ -198,22 +205,108 @@ jobs:
           if ("$before" -ne "$after") { throw "HibernateEnabled drifted across apply+restore: $before -> $after" }
           Write-Host "HibernateEnabled preserved ($before): OK"
 
-      - name: Opt-in tier applies and restores
+      - name: Opt-in tier applies and restores, verified by effect
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
+          $personalization = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization'
+          $policySystem    = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+          function Get-Val($p, $n) {
+            $i = Get-ItemProperty $p -ErrorAction SilentlyContinue
+            if ($null -eq $i -or $i.PSObject.Properties.Name -notcontains $n) { return $null }
+            return $i.$n
+          }
+
+          # Snapshot the authentication-tier values before anything touches them.
+          $beforeNoLock = Get-Val $personalization 'NoLockScreen'
+          $beforeWinL   = Get-Val $policySystem 'DisableLockWorkstation'
+          Write-Host "  before: NoLockScreen=$beforeNoLock DisableLockWorkstation=$beforeWinL"
+
           .\StayAwake.ps1 -DisableLockScreen
           if ($LASTEXITCODE -ne 0) { throw "DisableLockScreen apply exited $LASTEXITCODE" }
-
-          $nolock = (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization').NoLockScreen
-          if ($nolock -ne 1) { throw "NoLockScreen = $nolock, expected 1" }
-          $winl = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System').DisableLockWorkstation
-          if ($winl -ne 1) { throw "DisableLockWorkstation = $winl, expected 1" }
+          if ((Get-Val $personalization 'NoLockScreen') -ne 1) { throw 'NoLockScreen was not set to 1' }
+          if ((Get-Val $policySystem 'DisableLockWorkstation') -ne 1) { throw 'DisableLockWorkstation was not set to 1' }
           Write-Host '  opt-in tier applied OK'
 
           .\StayAwake.ps1 -Restore
           if ($LASTEXITCODE -ne 0) { throw "Restore after opt-in exited $LASTEXITCODE" }
-          Write-Host '  restore after opt-in OK'
+
+          # Checking the exit code alone cannot falsify a restore that silently
+          # skips this tier; compare the actual values back to the snapshot.
+          $afterNoLock = Get-Val $personalization 'NoLockScreen'
+          $afterWinL   = Get-Val $policySystem 'DisableLockWorkstation'
+          if ("$afterNoLock" -ne "$beforeNoLock") { throw "NoLockScreen not restored: $beforeNoLock -> $afterNoLock" }
+          if ("$afterWinL" -ne "$beforeWinL") { throw "DisableLockWorkstation not restored: $beforeWinL -> $afterWinL" }
+          Write-Host '  restore after opt-in verified by effect OK'
+
+      - name: Consecutive applies must not lose the original values
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Regression guard for the backup-overwrite bug: applying the opt-in
+          # tier and then the preset tier used to overwrite the only record of
+          # the authentication-tier originals, after which Restore exited 0 with
+          # the wake password still disabled.
+          $personalization = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization'
+          $policySystem    = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+          function Get-Val($p, $n) {
+            $i = Get-ItemProperty $p -ErrorAction SilentlyContinue
+            if ($null -eq $i -or $i.PSObject.Properties.Name -notcontains $n) { return $null }
+            return $i.$n
+          }
+          $before = @{
+            NoLockScreen = Get-Val $personalization 'NoLockScreen'
+            WinL         = Get-Val $policySystem 'DisableLockWorkstation'
+            Inactivity   = Get-Val $policySystem 'InactivityTimeoutSecs'
+          }
+          Write-Host "  before: $($before | ConvertTo-Json -Compress)"
+
+          .\StayAwake.ps1 -DisableLockScreen | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "opt-in apply exited $LASTEXITCODE" }
+          .\StayAwake.ps1 | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "preset apply exited $LASTEXITCODE" }
+
+          .\StayAwake.ps1 -Restore
+          if ($LASTEXITCODE -ne 0) { throw "Restore exited $LASTEXITCODE" }
+
+          $after = @{
+            NoLockScreen = Get-Val $personalization 'NoLockScreen'
+            WinL         = Get-Val $policySystem 'DisableLockWorkstation'
+            Inactivity   = Get-Val $policySystem 'InactivityTimeoutSecs'
+          }
+          foreach ($k in @('NoLockScreen', 'WinL', 'Inactivity')) {
+            if ("$($after[$k])" -ne "$($before[$k])") {
+              throw "$k not restored after consecutive applies: $($before[$k]) -> $($after[$k])"
+            }
+          }
+          Write-Host '  originals survived consecutive applies: OK'
+
+      - name: Elevation argument quoting handles spaces and quotes
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Start-Process -ArgumentList joins an array with spaces and does NOT
+          # quote the elements, so the script quotes them itself. Exercise that
+          # helper directly.
+          $src = Get-Content .\StayAwake.ps1 -Raw
+          $fn = [regex]::Match($src, '(?ms)^function ConvertTo-CommandLineArgument \{.*?^\}').Value
+          if (-not $fn) { throw 'ConvertTo-CommandLineArgument not found' }
+          Invoke-Expression $fn
+
+          $cases = @(
+            @{ In = 'simple';                 Out = 'simple' }
+            @{ In = 'C:\My Tools\StayAwake.ps1'; Out = '"C:\My Tools\StayAwake.ps1"' }
+            @{ In = '';                       Out = '""' }
+            @{ In = 'C:\dir with space\';     Out = '"C:\dir with space\\"' }
+          )
+          foreach ($c in $cases) {
+            $got = ConvertTo-CommandLineArgument $c.In
+            if ($got -ne $c.Out) { throw "quoting '$($c.In)': got [$got], expected [$($c.Out)]" }
+            Write-Host "  [$($c.In)] -> [$got]"
+          }
+          # A path with a space must never come back unquoted.
+          if ((ConvertTo-CommandLineArgument 'a b') -notmatch '^".*"$') { throw 'space argument was left unquoted' }
+          Write-Host 'Argument quoting: OK'
 
       - name: Guard mode holds an execution-state request
         shell: powershell

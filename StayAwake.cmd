@@ -7,9 +7,13 @@ rem editor instead of running it, which is the only reason this file exists).
 rem
 rem This launcher deliberately does NOT decide whether elevation is needed.
 rem Batch can only string-match the command line to guess, that guess drifts from
-rem the real parameter-set parsing in the script, and piping %* through `echo`
-rem lets an argument containing & or | run as a command. StayAwake.ps1 checks
-rem WindowsPrincipal directly and re-launches itself elevated when required.
+rem the real parameter-set parsing in the script, and piping the argument list
+rem through `echo` lets shell metacharacters in an argument run as commands.
+rem StayAwake.ps1 checks WindowsPrincipal directly and re-launches itself
+rem elevated when required.
+rem
+rem Note: `rem` does not protect metacharacters either, so no line in this file
+rem may contain an ampersand or a pipe, not even inside a comment.
 rem
 rem Set STAYAWAKE_NO_PAUSE=1 to skip the trailing pause (used by CI).
 
