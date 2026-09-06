@@ -531,11 +531,14 @@ function Invoke-Guard {
 public static extern uint SetThreadExecutionState(uint esFlags);
 '@
 
-    $ES_CONTINUOUS       = [uint32]0x80000000
+    # PowerShell 把 0x80000000 当 Int32 字面量解析，值是 -2147483648，
+    # 直接 [uint32] 转换会溢出。L 后缀强制走 Int64 字面量。
+    $ES_CONTINUOUS       = [uint32]0x80000000L
     $ES_SYSTEM_REQUIRED  = [uint32]0x00000001
     $ES_DISPLAY_REQUIRED = [uint32]0x00000002
 
-    $flags = $ES_CONTINUOUS -bor $ES_SYSTEM_REQUIRED -bor $ES_DISPLAY_REQUIRED
+    # -bor 会把操作数提升到 Int64，显式转回 UInt32 再交给 P/Invoke。
+    $flags = [uint32]($ES_CONTINUOUS -bor $ES_SYSTEM_REQUIRED -bor $ES_DISPLAY_REQUIRED)
     $prev = [StayAwake.Native]::SetThreadExecutionState($flags)
     if ($prev -eq 0) {
         throw "SetThreadExecutionState 失败 (Win32 错误 $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error()))"
