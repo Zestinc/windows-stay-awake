@@ -752,6 +752,13 @@ function Invoke-Restore {
         throw '旧备份未记录屏保运行状态，无法精确回滚当前会话；请使用新版 Apply 生成或补录的备份。尚未修改设置。'
     }
 
+    # 先恢复运行缓存，再恢复原策略；InactivityTimeoutSecs 恢复为正值后，
+    # Windows 会以 ERROR_ACCESS_DISABLED_BY_POLICY 拒绝屏保超时 API。
+    # 仅恢复运行缓存并广播（flags=2），避免把当时不一致的注册表原值覆盖掉。
+    $restoreSecure = @($backup.Items | Where-Object { $_.Key -eq 'ScreenSaverIsSecure' }).Count -gt 0
+    Set-ScreenSaverRuntime -Active $runtimeOriginal.Active -Timeout $runtimeOriginal.Timeout `
+        -IncludeSecure:$restoreSecure -Secure $runtimeOriginal.Secure -Flags 2
+
     $scheme = $backup.Scheme
     foreach ($item in $backup.Items) {
         if ($item.Kind -eq 'power') {
@@ -779,10 +786,13 @@ function Invoke-Restore {
         [void](Set-HibernateBestEffort -State $(if ([int]$hadHibernate -eq 1) { 'on' } else { 'off' }))
     }
 
-    # 仅恢复运行缓存并广播（flags=2），避免把当时不一致的注册表原值覆盖掉。
-    $restoreSecure = @($backup.Items | Where-Object { $_.Key -eq 'ScreenSaverIsSecure' }).Count -gt 0
-    Set-ScreenSaverRuntime -Active $runtimeOriginal.Active -Timeout $runtimeOriginal.Timeout `
-        -IncludeSecure:$restoreSecure -Secure $runtimeOriginal.Secure -Flags 2
+    # 策略恢复后仍要独立回读，不能只相信恢复策略前的 API 成功。
+    $runtimeRestored = Get-ScreenSaverRuntime
+    if ($runtimeRestored.Active -ne $runtimeOriginal.Active -or
+        $runtimeRestored.Timeout -ne $runtimeOriginal.Timeout -or
+        ($restoreSecure -and $runtimeRestored.Secure -ne $runtimeOriginal.Secure)) {
+        throw '恢复原策略后屏保运行状态不匹配，备份保留。'
+    }
 
     # 读回验证：直接按备份里记录的路径读，不重新解析「当前交互用户」。
     # 备份写的是 A 的 hive，若此刻登录的是 B，重新解析会去比 B 的值，
