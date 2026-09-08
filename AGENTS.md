@@ -5,10 +5,9 @@
 在 Windows 本机运行的单文件工具：关闭全部自动休眠 / 自动关屏 / 自动锁屏，
 让机器保持唤醒并持续显示当前界面。无依赖，Windows PowerShell 5.1 起可用。
 
-**不要并入 `windows-remote-bootstrap`**：那个 repo 的 `AGENTS.md` 明令禁止加常驻
-进程和弱化 UAC，而本工具的 `-Guard` 与 `-DisableLockScreen` 正踩这两条；它还要求
-每次改动发一个哈希锁定的新版本，跟这里的迭代节奏不兼容。两者的关系是互补：
-那边是从 Mac 远程控 Windows，这边是在 Windows 本机跑。
+**保持成独立的单文件工具**：`-Guard` 与 `-DisableLockScreen` 需要常驻进程并放宽
+锁屏策略，任何要求「无常驻、不弱化 UAC、每次改动发哈希锁定新版本」的分发方式都
+容不下它。控制这台 Windows 的远程通道是 Moonlight 串流，与本工具无关。
 
 ## 怎么跑 / 怎么验证
 
@@ -45,7 +44,7 @@
 
 - **真实 UAC 弹窗在任何 CI 上都测不到**：runner 自身就是管理员，提权分支跑不到。
 - 组策略冲突、多用户登录、域环境这几条只有检测和报告，没有 CI 覆盖。
-- 家里那台 Windows 的接入方式见 `windows-remote-bootstrap`；它不在线时无法实机验证。
+- 家里那台 Windows 只经 Moonlight 串流操作（没有 SSH）；它不在线时无法实机验证。
 
 ## 当前状态
 
